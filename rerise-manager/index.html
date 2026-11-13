@@ -39,7 +39,7 @@
 <script>
 (()=>{'use strict';
 const STORE_KEY='rerise.manager.mvp.v1';
-const APP_VERSION='1.3';
+const APP_VERSION='1.4';
 const STAGES=['アポ前','アポ調整中','説明後','登録済み','初期育成','活動中'];
 const SEMINARS=['事業説明','製品シェア会','ワンデー','フェロートレーニング','インプレッションセミナー','シェア会','その他'];
 const SHEETS=[{id:'new',icon:'🟢',short:'新規',title:'新規ゲストシート'},{id:'registered',icon:'🟠',short:'登録後',title:'新規登録後ゲストシート'},{id:'member',icon:'🔴',short:'メンバー',title:'メンバーゲストシート'},{id:'miho',icon:'🟡',short:'美穂面談',title:'花井美穂面談用ゲストシート'}];
@@ -84,7 +84,7 @@ function uid(){return (globalThis.crypto?.randomUUID?.()||'id-'+Date.now()+'-'+M
 function openModal(html){document.getElementById('modal-root').innerHTML=`<div class="modal-wrap" data-backdrop="true"><div class="modal" role="dialog" aria-modal="true">${html}</div></div>`}
 function closeModal(){document.getElementById('modal-root').innerHTML=''}
 function newPersonModal(){openModal(`<h2>＋ 人物を追加</h2><div class="small-muted">名前だけで登録できます。情報は後で入力。</div><form id="new-form"><div class="field"><label>名前（必須）</label><input required maxlength="100" class="input" name="name" placeholder="例：山田さん" autofocus></div><div class="field"><label>紹介者</label><input class="input" name="introducer" maxlength="100" placeholder="例：花本良"></div><div class="field"><label>担当者</label><input class="input" name="owner" maxlength="100" placeholder="例：花本良"></div><div class="modal-actions"><button type="button" class="btn" data-action="close-modal">キャンセル</button><button type="submit" class="btn primary">登録する</button></div></form>`)}
-function backupModal(){openModal(`<h2>バックアップ・復元</h2><p class="small-muted">試作版では情報はブラウザ単位で保存されます。JSONで書き出せます。ChatGPTが作成した登録用JSONを読み込み、既存の人物に追加・空欄だけ補完することもできます。</p><div class="note notice-warn"><strong>注意：</strong>バックアップは暗号化されていません。個人情報を含む状態では、他人に送信したり、公開フォルダへ置いたりしないでください。</div><div class="actionrow" style="margin-top:15px"><button class="btn primary" data-action="export">バックアップを保存</button><button class="btn" data-action="choose-import-merge">ゲストデータを追加・補完</button><button class="btn" data-action="choose-import-replace">全件置き換え（復元）</button></div><input id="backup-file" class="hidden" type="file" accept="application/json,.json"><div class="modal-actions"><button class="btn" data-action="close-modal">閉じる</button></div>`)}
+function backupModal(){openModal(`<h2>バックアップ・復元</h2><p class="small-muted">情報はこの端末のブラウザに保存されます。取り込み前にバックアップを保存してください。『ゲストシートを更新・追加』なら、既存人物のシート情報だけを更新し、活動進捗・セミナー履歴・送信履歴は維持します。</p><div class="note notice-warn"><strong>注意：</strong>バックアップは暗号化されていません。個人情報を含む状態では、他人に送信したり、公開フォルダへ置いたりしないでください。</div><div class="actionrow" style="margin-top:15px"><button class="btn primary" data-action="export">バックアップを保存</button><button class="btn dark" data-action="choose-import-update">ゲストシートを更新・追加</button><button class="btn" data-action="choose-import-merge">空欄だけ補完</button><button class="btn" data-action="choose-import-replace">全件置き換え（復元）</button></div><input id="backup-file" class="hidden" type="file" accept="application/json,.json"><div class="modal-actions"><button class="btn" data-action="close-modal">閉じる</button></div>`)}
 async function copy(txt){try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(txt);return true}const el=document.createElement('textarea');el.value=txt;el.style.position='fixed';el.style.left='-9999px';document.body.appendChild(el);el.focus();el.select();const ok=document.execCommand('copy');el.remove();return ok}catch(e){return false}}
 async function shareSheet(){const p=person();const txt=sheetText(p,ui.sheet);if(navigator.share){try{await navigator.share({title:`${p.name}・${SHEETS.find(s=>s.id===ui.sheet).title}`,text:txt});toast('共有操作を完了しました。実際の送信済み記録は別途行ってください。');return}catch(e){if(e.name==='AbortError')return}}const okay=await copy(txt);toast(okay?'共有できない環境のため、本文をコピーしました。':'共有できませんでした。コピー機能をお試しください。')}
 function updateField(field,value){const p=person();if(!p)return;p[field]=value;p.updatedAt=new Date().toISOString();save()}
@@ -97,6 +97,32 @@ function importRecords(payload,mode){
  if(mode==='replace'){
   if(!confirm(`既存の${people.length}名を削除して、読み込んだ${next.length}名で置き換えます。よろしいですか？`))return null;
   people=next;return {added:next.length,filled:0,skipped:0};
+ }
+ if(mode==='update'){
+  // Only public schema fields belonging to guest sheets are updateable. Never overwrite progress/registration history.
+  const writable=new Set(['age','location','job','personality','family','relation','features','health','economy','freeTime','friends','hobbies','approach','reason','introducer','networkExperience']);
+  const norm=x=>String(x||'').replace(/[\s　・さん様]/g,'').toLowerCase();
+  const matching=next.filter(p=>people.some(old=>norm(old.name)===norm(p.name)));
+  const adding=next.filter(p=>!people.some(old=>norm(old.name)===norm(p.name)));
+  const names=next.map(p=>p.name).join('、');
+  if(!confirm(`ゲストシート更新を実行しますか？\n既存 ${matching.length}名を更新・新規 ${adding.length}名を追加\n対象：${names}\n\n既存の活動進捗・参加履歴・送信履歴・登録状況は保持します。`))return null;
+  let changed=0;
+  for(const incoming of next){
+   const old=people.find(p=>norm(p.name)===norm(incoming.name));
+   if(!old){
+    // Keep add-only defaults without treating a planned outreach as completed.
+    people.push({...incoming,stage:'アポ前',nextAction:'',nextDate:'',owner:incoming.introducer||'',checks:{},sessions:[],sharedHistory:[],registrationDate:'',createdAt:new Date().toISOString()});
+    continue;
+   }
+   for(const key of writable){
+    if(!Object.hasOwn(incoming,key))continue;
+    const value=incoming[key];
+    if(typeof value!=='string'||!value.trim())continue;
+    if(old[key]!==value){old[key]=value;changed++;}
+   }
+   old.updatedAt=new Date().toISOString();
+  }
+  return {added:adding.length,filled:changed,skipped:0,updated:matching.length};
  }
  let added=0,filled=0,skipped=0;
  for(const incoming of next){
@@ -136,10 +162,10 @@ document.addEventListener('click',async e=>{if(e.target.dataset.backdrop){closeM
  if(a==='add-seminar'){const type=document.getElementById('seminar-type').value;const date=document.getElementById('seminar-date').value;p.sessions=p.sessions||[];p.sessions.push({id:uid(),type,date});if(type==='フェロートレーニング'){p.checks=p.checks||{};p.checks.fellow=true}save();render();toast('参加履歴を追加しました。');return}
  if(a==='remove-seminar'){if(confirm('この参加履歴を削除しますか？')){p.sessions=p.sessions.filter(s=>s.id!==b.dataset.id);save();render()}return}
  if(a==='export'){const data=JSON.stringify({app:'RE:RISE Manager',version:1,exportedAt:new Date().toISOString(),people},null,2);const blob=new Blob([data],{type:'application/json'});const url=URL.createObjectURL(blob);const an=document.createElement('a');an.href=url;an.download='RE-RISE-backup-'+new Date().toLocaleDateString('sv-SE')+'.json';document.body.appendChild(an);an.click();an.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('バックアップを保存しました。');return}
- if(a==='choose-import-merge'||a==='choose-import-replace'){importMode=a==='choose-import-merge'?'merge':'replace';document.getElementById('backup-file').click();return}
+ if(a==='choose-import-merge'||a==='choose-import-replace'||a==='choose-import-update'){importMode=a==='choose-import-update'?'update':a==='choose-import-merge'?'merge':'replace';document.getElementById('backup-file').click();return}
 });
 document.addEventListener('input',e=>{if(e.target.id==='search'){ui.search=e.target.value;renderPeople();return}if(e.target.dataset.field)updateField(e.target.dataset.field,e.target.value)});
-document.addEventListener('change',e=>{const t=e.target;if(t.id==='filter'){ui.filter=t.value;render();return}if(t.dataset.check){const p=person();p.checks=p.checks||{};p.checks[t.dataset.check]=t.checked;if(t.dataset.check==='registered' && t.checked && ['アポ前','アポ調整中','説明後'].includes(p.stage))p.stage='登録済み';save();render();return}if(t.dataset.field){updateField(t.dataset.field,t.value);if(['name','stage','owner','introducer','nextAction','nextDate'].includes(t.dataset.field))render();return}if(t.id==='seminar-type'){ui.seminarType=t.value;return}if(t.id==='seminar-date'){ui.seminarDate=t.value;return}if(t.id==='backup-file'){const f=t.files?.[0];if(!f)return;f.text().then(raw=>{try{const j=JSON.parse(raw);if(j.app!=='RE:RISE Manager'||!Array.isArray(j.people))throw Error('形式が一致しません');const report=importRecords(j,importMode);if(!report)return;save();closeModal();ui.view='list';ui.personId=null;ui.filter='すべて';render();toast(`取り込み完了：${report.added}人追加・${report.filled}項目補完`);}catch(err){toast('読み込みに失敗：'+(err.message||'ファイル形式を確認してください。'))}});return}});
+document.addEventListener('change',e=>{const t=e.target;if(t.id==='filter'){ui.filter=t.value;render();return}if(t.dataset.check){const p=person();p.checks=p.checks||{};p.checks[t.dataset.check]=t.checked;if(t.dataset.check==='registered' && t.checked && ['アポ前','アポ調整中','説明後'].includes(p.stage))p.stage='登録済み';save();render();return}if(t.dataset.field){updateField(t.dataset.field,t.value);if(['name','stage','owner','introducer','nextAction','nextDate'].includes(t.dataset.field))render();return}if(t.id==='seminar-type'){ui.seminarType=t.value;return}if(t.id==='seminar-date'){ui.seminarDate=t.value;return}if(t.id==='backup-file'){const f=t.files?.[0];if(!f)return;f.text().then(raw=>{try{const j=JSON.parse(raw);if(j.app!=='RE:RISE Manager'||!Array.isArray(j.people))throw Error('形式が一致しません');const report=importRecords(j,importMode);if(!report)return;save();closeModal();ui.view='list';ui.personId=null;ui.filter='すべて';render();toast(importMode==='update'?`更新完了：${report.updated}人更新・${report.added}人追加・${report.filled}項目変更`:`取り込み完了：${report.added}人追加・${report.filled}項目補完`);}catch(err){toast('読み込みに失敗：'+(err.message||'ファイル形式を確認してください。'))}});return}});
 document.addEventListener('submit',e=>{if(e.target.id==='new-form'){e.preventDefault();const form=new FormData(e.target);const name=String(form.get('name')||'').trim();if(!name)return;const p={id:uid(),name,introducer:String(form.get('introducer')||''),owner:String(form.get('owner')||''),stage:'アポ前',nextAction:'',nextDate:'',checks:{},sessions:[],sharedHistory:[],createdAt:new Date().toISOString()};people.unshift(p);save();closeModal();ui.personId=p.id;ui.sheet='new';ui.mode='edit';changeView('sheet');toast('人物を登録しました。')}});
 if('serviceWorker' in navigator&&location.protocol.startsWith('http')){window.addEventListener('load',()=>navigator.serviceWorker.register('./service-worker.js').catch(()=>{}))}
 render();
