@@ -1,7 +1,12 @@
-# RE:RISE Manager v1.3
+# RE:RISE Manager v1.5
 
-シンプルなゲスト・活動管理PWA。iPhone Safariの共有 → ホーム画面に追加で利用可能。
+GitHub Pages 用PWA。公開リポジトリにはゲストデータを含めません。
 
-**重要**：公開リポジトリには人物情報を置かない。アプリはブラウザの localStorage にのみ保存される。端末間の同期や権限管理は未実装。個人情報の入力・共有は慎重に行う。
+Google Sheets cloud sync:
+1. Private Google Sheet `People`: columns `person_id, name, stage, updated_at, person_json, owner`.
+2. Google Cloud Console: create OAuth client type **Web application**; authorized JS origin `https://hanamon21.github.io`; add the `https://www.googleapis.com/auth/spreadsheets` scope and allowed test accounts if necessary.
+3. Configure OAuth client ID in app **設定** then click Google login > cloud pull.
 
-人物データは個別に配布されたJSONを、設定 → バックアップ・データ取り込みから端末へ読み込む。
+Google Cloud authorization and Google Drive sharing are controlled by sheet owner. OAuth tokens are memory-only. No untrusted users can view data just by knowing the sheet ID.
+
+If another device changes the same person, the app stops synchronization rather than silently overwriting the concurrent update.

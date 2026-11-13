@@ -36,10 +36,11 @@
 <div id="app"></div>
 <div id="modal-root"></div>
 <div id="toast-root" aria-live="polite"></div>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 (()=>{'use strict';
 const STORE_KEY='rerise.manager.mvp.v1';
-const APP_VERSION='1.4';
+const APP_VERSION='1.5';
 const STAGES=['アポ前','アポ調整中','説明後','登録済み','初期育成','活動中'];
 const SEMINARS=['事業説明','製品シェア会','ワンデー','フェロートレーニング','インプレッションセミナー','シェア会','その他'];
 const SHEETS=[{id:'new',icon:'🟢',short:'新規',title:'新規ゲストシート'},{id:'registered',icon:'🟠',short:'登録後',title:'新規登録後ゲストシート'},{id:'member',icon:'🔴',short:'メンバー',title:'メンバーゲストシート'},{id:'miho',icon:'🟡',short:'美穂面談',title:'花井美穂面談用ゲストシート'}];
@@ -51,13 +52,115 @@ const fields={
  miho:[F('name','名前'),F('age','年齢（年代）'),F('location','住まい'),F('job','職業'),F('family','家族構成',true,'textarea'),F('hobbies','趣味や夢',true,'textarea'),F('registrationDate','登録日（年月日）',false,'date'),F('registrationType','登録時：愛用・付き合い・ビジネス',false,'select',['','愛用','付き合い','ビジネス']),F('businessActivity','ビジネス開始からの動き',true,'textarea'),F('seminarSummary','セミナー参加の有無（参加履歴から自動表示）',true,'auto'),F('spiritLeader','スピリット以上リーダーで繋いだ人',true,'textarea'),F('mihoInvitation','なんと言って美穂面談誘導したか？',true,'textarea'),F('accompanyLeader','面談同行リーダーの名前')]
 };
 const CHECKS=[['registered','新規登録'],['fellow','フェロートレーニング'],['miho','花井美穂さんとの面談'],['list100','100人リスト'],['dream','夢リスト'],['outreach','声かけ・連絡'],['marketing','マーケティング練習'],['meeting','打ち合わせ'],['report','活動報告']];
+
+// Cloud data: private Google Sheet accessed with the signed-in user's short-lived OAuth token.
+const CLOUD_SETTINGS_KEY='rerise.manager.cloud.v1';
+const CLOUD_DEFAULT_ID='19i7zJ7bDYrlB4MWGW23r9UlLr-f8DKsqRztylSzKR6M';
+const cloudSaved=(()=>{try{return JSON.parse(localStorage.getItem(CLOUD_SETTINGS_KEY)||'{}')}catch{return {}}})();
+const cloud={clientId:cloudSaved.clientId||'',spreadsheetId:cloudSaved.spreadsheetId||CLOUD_DEFAULT_ID,accessToken:'',state:'未接続',ready:false,rows:new Map(),snapshots:new Map(),timer:null,busy:false,dirtyCounter:0,pendingConflicts:[]};
+const API='https://sheets.googleapis.com/v4/spreadsheets/';
+const CLOUD_SHEET='People';
+function cloudMessage(){return cloud.ready?'同期中'+(cloud.busy?'…':'（自動同期ON）'):cloud.accessToken?'Google認証済み・未読み込み':'未接続（端末内保存）'}
+function cloudConfigSave(){let id=document.getElementById('google-client-id')?.value.trim()||'';let sid=document.getElementById('google-sheet-id')?.value.trim()||'';sid=sid.match(/\/spreadsheets\/d\/([A-Za-z0-9_-]+)/)?.[1]||sid;if(sid&&!/^[A-Za-z0-9_-]{20,}$/.test(sid)){toast('スプレッドシートIDが正しくありません');return}if(id&&!/^[0-9]+-[a-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id)){toast('Google OAuthクライアントIDを確認してください');return}if(cloud.accessToken&&cloud.spreadsheetId!==sid){cloud.accessToken='';cloud.ready=false;}cloud.clientId=id;cloud.spreadsheetId=sid||CLOUD_DEFAULT_ID;localStorage.setItem(CLOUD_SETTINGS_KEY,JSON.stringify({clientId:cloud.clientId,spreadsheetId:cloud.spreadsheetId}));toast('Google連携設定を保存しました');render()}
+function cloudSignIn(){
+ if(!cloud.clientId){toast('先にGoogle OAuthクライアントIDを設定・保存してください');return}
+ if(!window.google?.accounts?.oauth2){toast('Google認証ライブラリを読み込めません。通信環境をご確認ください');return}
+ const auth=google.accounts.oauth2.initTokenClient({client_id:cloud.clientId,scope:'https://www.googleapis.com/auth/spreadsheets',callback:async response=>{
+   if(response.error||!response.access_token){toast('Google認証に失敗しました');return}
+   cloud.accessToken=response.access_token;cloud.ready=false;cloud.state='認証済み';
+   toast('Google認証が完了しました。');render();if(!people.length)await cloudPull();
+ },error_callback:()=>toast('Google認証がキャンセルされました')});
+ auth.requestAccessToken({prompt:'consent'});
+}
+function cloudUrl(range){if(!cloud.spreadsheetId)throw Error('シートID未設定');return API+encodeURIComponent(cloud.spreadsheetId)+'/values/'+encodeURIComponent(range)}
+async function cloudRequest(url,opts={}){
+ if(!cloud.accessToken)throw Error('Google認証が必要です');
+ const response=await fetch(url,{...opts,headers:{Authorization:'Bearer '+cloud.accessToken,...(opts.body?{'Content-Type':'application/json'}:{}),...(opts.headers||{})},cache:'no-store'});
+ const payload=await response.json().catch(()=>({}));
+ if(!response.ok){if(response.status===401){cloud.ready=false;cloud.accessToken=''}throw Error(response.status===403?'シートへのアクセス権限がありません。共有設定を確認してください':(payload.error?.message||'Google APIエラー '+response.status))}
+ return payload;
+}
+async function cloudReadRows(){
+ const x=await cloudRequest(cloudUrl(CLOUD_SHEET+'!A1:F3000'));
+ const arr=x.values||[];
+ if(arr.length===0||arr[0][0]!=='person_id'||arr[0][4]!=='person_json')throw Error('Peopleシートの列が一致しません');
+ const found=[];const rows=new Map();const snapshots=new Map();
+ for(let i=1;i<arr.length;i++){
+  const row=arr[i];if(!row?.[0]||!row?.[4])continue;
+  let p;try{p=JSON.parse(row[4])}catch{throw Error(`${i+1}行目のJSONが正しくありません`)}
+  if(p.id!==row[0]||!p.name)throw Error(`${i+1}行目の人物IDに不整合があります`);
+  if(rows.has(p.id))throw Error('重複する人物ID：'+p.id);
+  found.push(p);rows.set(p.id,i+1);snapshots.set(p.id,JSON.stringify(p));
+ }
+ return {people:found,rows,snapshots};
+}
+async function cloudPull(){
+ if(!cloud.accessToken){toast('Googleにログインしてください');return}
+ if(cloud.ready&&cloud.dirtyCounter>0&&cloud.busy){toast('同期処理中です');return}
+ if(people.length&&!confirm('クラウドの人物情報で現在の画面を置き換えます。端末内の現在の情報は自動バックアップしてから読み込みます。よろしいですか？'))return;
+ try{
+  cloud.state='読み込み中';const result=await cloudReadRows();
+  localStorage.setItem('rerise.manager.pre-cloud-backup.'+Date.now(),JSON.stringify(people));
+  people=result.people;cloud.rows=result.rows;cloud.snapshots=result.snapshots;cloud.ready=true;cloud.dirtyCounter=0;cloud.pendingConflicts=[];
+  localStorage.setItem(STORE_KEY,JSON.stringify(people));ui.view='list';ui.personId=null;ui.filter='すべて';cloud.state='接続済み';render();toast(`${people.length}名をクラウドから読み込みました。編集は自動同期されます。`);
+ }catch(err){cloud.ready=false;cloud.state='読み込みエラー';toast('読み込み失敗：'+err.message)}
+}
+function cloudSchedule(){if(!cloud.ready)return;cloud.dirtyCounter++;clearTimeout(cloud.timer);cloud.timer=setTimeout(()=>cloudFlush(),1800)}
+async function cloudFlush(){
+ if(!cloud.ready||!cloud.accessToken||cloud.busy)return;
+ cloud.busy=true;const revision=cloud.dirtyCounter;
+ try{
+  const current=await cloudReadRows();
+  const local=new Map(people.map(p=>[p.id,p]));
+  const prev=cloud.snapshots;
+  const edits=[];const newRows=[];const conflicts=[];
+  const stale=[];
+  // This compares every known row against the last successfully synchronized version.
+  // If another editor changed the same person remotely, do not overwrite their data.
+  for(const [id,record] of local){
+   const serialized=JSON.stringify(record);
+   if(prev.has(id)&&prev.get(id)===serialized)continue;
+   if(current.snapshots.has(id)){
+    if(prev.has(id)&&prev.get(id)!==current.snapshots.get(id)){conflicts.push(record.name);continue}
+    const rowIndex=current.rows.get(id);
+    edits.push({range:`'${CLOUD_SHEET}'!A${rowIndex}:F${rowIndex}`,values:[[id,record.name,record.stage||'',record.updatedAt||'',serialized,record.owner||'']]});
+   }else if(!prev.has(id)){
+    newRows.push([id,record.name,record.stage||'',record.updatedAt||'',serialized,record.owner||'']);
+   }else conflicts.push(record.name);
+  }
+  for(const [id,serialized] of prev){
+   if(local.has(id))continue;
+   if(current.snapshots.has(id)&&current.snapshots.get(id)!==serialized){conflicts.push(id);continue}
+   if(current.rows.has(id)){const n=current.rows.get(id);edits.push({range:`'${CLOUD_SHEET}'!A${n}:F${n}`,values:[['','','','','','']]});stale.push(id)}
+  }
+  if(conflicts.length){cloud.pendingConflicts=conflicts;cloud.state='競合あり';toast('他の端末で同じ人物が更新されています：'+conflicts.join('、')+'。クラウドから読み込み直してください。');return}
+  if(edits.length){await cloudRequest(API+encodeURIComponent(cloud.spreadsheetId)+'/values:batchUpdate',{method:'POST',body:JSON.stringify({valueInputOption:'RAW',data:edits})})}
+  if(newRows.length){await cloudRequest(cloudUrl(CLOUD_SHEET+'!A:F')+':append?valueInputOption=RAW&insertDataOption=INSERT_ROWS',{method:'POST',body:JSON.stringify({values:newRows})})}
+  const refreshed=await cloudReadRows();cloud.rows=refreshed.rows;cloud.snapshots=refreshed.snapshots;cloud.state='接続済み';cloud.pendingConflicts=[];
+  if(edits.length||newRows.length)toast('クラウドへ同期しました');
+ }catch(err){cloud.state='同期エラー';toast('同期できませんでした：'+err.message)}
+ finally{cloud.busy=false;if(cloud.ready&&cloud.dirtyCounter!==revision)cloudSchedule();}
+}
+async function cloudRefresh(){
+ if(!cloud.ready||!cloud.accessToken||cloud.busy||cloud.pendingConflicts.length)return;
+ const localIds=new Set(people.map(p=>p.id));
+ if(people.some(p=>cloud.snapshots.get(p.id)!==JSON.stringify(p))||[...cloud.snapshots.keys()].some(id=>!localIds.has(id)))return;
+ cloud.busy=true;
+ try{const fresh=await cloudReadRows();const changed=fresh.people.length!==people.length||fresh.people.some(p=>cloud.snapshots.get(p.id)!==JSON.stringify(p));if(changed){people=fresh.people;cloud.rows=fresh.rows;cloud.snapshots=fresh.snapshots;localStorage.setItem(STORE_KEY,JSON.stringify(people));if(ui.personId&&!people.some(p=>p.id===ui.personId)){ui.personId=null;ui.view='list'}render();toast('最新のクラウド情報を反映しました。')}}
+ catch(err){cloud.state='同期エラー';toast('更新確認に失敗：'+err.message)}finally{cloud.busy=false;}
+}
+window.addEventListener('focus',()=>cloudRefresh());
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')cloudRefresh()});
+setInterval(()=>{if(document.visibilityState==='visible')cloudRefresh()},90000);
+function renderCloudSettings(){return `<div class="card card-pad" style="margin-top:16px"><div class="section-title">☁ Googleクラウド同期</div><div class="section-note">Googleのログインでシートにアクセスします。許可されたユーザーだけが閲覧できます。認証後に読み込むと、編集内容をクラウドに保存します。</div><div class="note" style="margin:12px 0"><b>現在：</b>${esc(cloudMessage())}${cloud.pendingConflicts.length?'<br>⚠️ 他端末との編集競合があります':''}</div><div class="field-grid"><div class="field wide"><label>Google OAuthクライアントID（初回のみ）</label><input id="google-client-id" class="input" value="${esc(cloud.clientId)}" placeholder="123456...apps.googleusercontent.com"></div><div class="field wide"><label>GoogleスプレッドシートID</label><input id="google-sheet-id" class="input" value="${esc(cloud.spreadsheetId)}"></div></div><div class="actionrow" style="margin-top:13px"><button class="btn" data-action="cloud-config">設定を保存</button><button class="btn primary" data-action="cloud-login">Googleでログイン</button><button class="btn dark" data-action="cloud-pull">クラウドから読み込み</button><button class="btn" data-action="cloud-flush">変更を今すぐ同期</button></div><div class="note" style="margin-top:12px">※ OAuthクライアントIDの作成にはGoogle Cloud Consoleで一度だけ設定が必要です。公開リポジトリにはトークンや個人データを保存しません。<br>※ アプリを開き直した場合は再度Googleログインしてください。<br>※ ブラウザ内に保存した古いゲストデータは「クラウドから読み込み」で入れ替わります。</div><details style="margin-top:14px"><summary style="cursor:pointer;font-weight:750">初回接続の手順（1度だけ）</summary><div class="note" style="margin-top:9px">1. <a href="https://console.cloud.google.com/apis/library/sheets.googleapis.com" target="_blank" rel="noopener noreferrer">Google Cloud Console</a>でプロジェクトを作成し、Google Sheets APIを有効化。<br>2. Google認証プラットフォームでOAuth同意画面を設定し、テストユーザーとして自分とリーダーを追加。<br>3. 「OAuthクライアントID」をウェブアプリケーション用に作成。承認済みのJavaScript生成元：<b>https://hanamon21.github.io</b><br>4. 発行されたクライアントIDを上欄に貼って「設定を保存」→「Googleでログイン」→「クラウドから読み込み」。<br>5. リーダーにはGoogleスプレッドシートの共有権限を追加してください。<br>※ OAuthクライアントシークレットは、このアプリには入力しません。</div></details></div>`}
+
 const sample=[];
 let people=readStore();
 let ui={view:'list',personId:null,sheet:'new',mode:'edit',filter:'すべて',search:'',seminarType:'事業説明',seminarDate:new Date().toLocaleDateString('sv-SE')};
 let toastTimer;
 let importMode='merge';
 function readStore(){try{const raw=localStorage.getItem(STORE_KEY);if(!raw)return structuredClone(sample);const j=JSON.parse(raw);if(!Array.isArray(j))return structuredClone(sample);if(sample.length && j.length && j.every(p=>String(p.id||'').startsWith('demo-')))return structuredClone(sample);return j;}catch(e){return structuredClone(sample)}}
-function save(){try{localStorage.setItem(STORE_KEY,JSON.stringify(people))}catch(e){toast('保存できませんでした。ブラウザの容量・設定をご確認ください。')}}
+function save(){try{localStorage.setItem(STORE_KEY,JSON.stringify(people));cloudSchedule()}catch(e){toast('保存できませんでした。ブラウザの容量・設定をご確認ください。')}}
 function person(){return people.find(p=>p.id===ui.personId)}
 function esc(v){return String(v??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
 function val(p,key){if(key==='seminarSummary')return sessionSummary(p);if(key==='registrationDate')return p.registrationDate||'';return p[key]||''}
@@ -67,11 +170,11 @@ function badge(s){const cls=s==='活動中'?'mint':s==='初期育成'||s==='ア�
 function countDue(){const today=new Date().toLocaleDateString('sv-SE');return people.filter(p=>p.nextAction && p.nextDate && p.nextDate<=today).length}
 function initials(name){const x=String(name||'ゲ');return x.startsWith('サンプル ')?x.split(' ')[1]?.slice(0,1)||'ゲ':x.slice(0,1)}
 function render(){const isList=ui.view==='list';const isSettings=ui.view==='settings';const isDue=isList&&ui.filter==='要対応';const isPeople=isList&&!isDue;const p=person();if(!isList&&!isSettings&&!p){ui.view='list';return render()}
- document.getElementById('app').innerHTML=`<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark"><img src="icons/icon-192.png" width="42" height="42" alt="RE:RISE Manager" style="width:42px;height:42px;object-fit:cover;border-radius:11px"></div><div><div class="brand-name">RE:RISE</div><div class="brand-sub">GUEST & ACTIVITY</div></div></div><nav class="nav"><button class="nav-btn ${isPeople?'active':''}" data-action="go-list"><span class="nav-icon">▦</span>人物一覧</button><button class="nav-btn ${isDue?'active':''}" data-action="go-due"><span class="nav-icon">✓</span>要対応</button><button class="nav-btn ${isSettings?'active':''}" data-action="go-settings"><span class="nav-icon">⚙</span>設定</button></nav><div class="side-note">必要な情報だけを、必要なときに。<br>LINE共有は本人確認後に行ってください。<br><br>v1.3・端末内保存</div></aside><main class="main">${isList?renderList():isSettings?renderSettings():renderDetail(p)}</main></div><nav class="mobile-bottom" aria-label="メインメニュー"><button class="${isPeople?'active':''}" data-action="go-list"><span class="emoji">▦</span>人物一覧</button><button class="${isDue?'active':''}" data-action="go-due"><span class="emoji">✓</span>要対応${countDue()?` (${countDue()})`:''}</button><button class="${isSettings?'active':''}" data-action="go-settings"><span class="emoji">⚙</span>設定</button></nav>`;
+ document.getElementById('app').innerHTML=`<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark"><img src="icons/icon-192.png" width="42" height="42" alt="RE:RISE Manager" style="width:42px;height:42px;object-fit:cover;border-radius:11px"></div><div><div class="brand-name">RE:RISE</div><div class="brand-sub">GUEST & ACTIVITY</div></div></div><nav class="nav"><button class="nav-btn ${isPeople?'active':''}" data-action="go-list"><span class="nav-icon">▦</span>人物一覧</button><button class="nav-btn ${isDue?'active':''}" data-action="go-due"><span class="nav-icon">✓</span>要対応</button><button class="nav-btn ${isSettings?'active':''}" data-action="go-settings"><span class="nav-icon">⚙</span>設定</button></nav><div class="side-note">必要な情報だけを、必要なときに。<br>LINE共有は本人確認後に行ってください。<br><br>v1.5・Google同期対応</div></aside><main class="main">${isList?renderList():isSettings?renderSettings():renderDetail(p)}</main></div><nav class="mobile-bottom" aria-label="メインメニュー"><button class="${isPeople?'active':''}" data-action="go-list"><span class="emoji">▦</span>人物一覧</button><button class="${isDue?'active':''}" data-action="go-due"><span class="emoji">✓</span>要対応${countDue()?` (${countDue()})`:''}</button><button class="${isSettings?'active':''}" data-action="go-settings"><span class="emoji">⚙</span>設定</button></nav>`;
  if(isList)renderPeople();
 }
-function renderList(){return `<header class="topbar"><div><div class="eyebrow">RE:RISE Manager</div><h1 class="heading">人物一覧</h1><div class="subheading">ゲスト・メンバーの状況を、ひと目で。</div></div><button class="btn primary" data-action="new-person">＋ 人物追加</button></header><div class="stats"><div class="stat"><div class="stat-label">管理人数</div><div class="stat-n">${people.length}</div></div><div class="stat"><div class="stat-label">登録済み・活動中</div><div class="stat-n">${people.filter(p=>['登録済み','初期育成','活動中'].includes(p.stage)).length}</div></div><div class="stat"><div class="stat-label">期限が来た次の行動</div><div class="stat-n">${countDue()}</div></div></div><div class="card card-pad"><div class="toolbar"><input id="search" class="input search" aria-label="名前で検索" placeholder="🔎 名前・担当者で検索" value="${esc(ui.search)}"><select id="filter" class="select" aria-label="状況で絞り込み">${['すべて','ゲスト','登録済み','活動中','要対応'].map(s=>`<option ${ui.filter===s?'selected':''}>${s}</option>`).join('')}</select></div><div id="people-list" class="people"></div></div><div class="note notice-warn" style="margin-top:17px">🔒 <b>データの保存について：</b> データはこのブラウザ内だけに保存されます。ログイン・端末間同期・権限管理は未実装です。実名や健康・経済などの個人情報はこの端末のブラウザ内で保存され、クラウドには同期されません。共有端末では使用せず、端末のロックとバックアップ保護を徹底してください。</div>`}
-function renderSettings(){return `<header class="topbar"><div><div class="eyebrow">RE:RISE Manager</div><h1 class="heading">設定</h1><div class="subheading">データの管理とアプリの確認。</div></div></header><div class="card card-pad"><div class="section-title">データのバックアップ</div><div class="section-note">保存済みの情報を書き出したり、以前のバックアップを読み込めます。</div><button class="btn primary" style="margin-top:17px" data-action="backup">バックアップ・データ取り込み</button></div><div class="note notice-warn" style="margin-top:17px"><b>データの安全性について：</b> データは現在のブラウザ内にだけ保存されます。端末間の同期・ログイン・リーダー別の閲覧権限は未実装です。実名・健康・経済情報の共有には本人の了解が必要です。バックアップファイルも暗号化されません。</div><div class="note" style="margin-top:12px">アプリ：RE:RISE Manager v1.3（iPhoneホーム画面対応・端末内保存）</div>`}
+function renderList(){return `<header class="topbar"><div><div class="eyebrow">RE:RISE Manager</div><h1 class="heading">人物一覧</h1><div class="subheading">ゲスト・メンバーの状況を、ひと目で。　☁ ${esc(cloudMessage())}</div></div><button class="btn primary" data-action="new-person">＋ 人物追加</button></header><div class="stats"><div class="stat"><div class="stat-label">管理人数</div><div class="stat-n">${people.length}</div></div><div class="stat"><div class="stat-label">登録済み・活動中</div><div class="stat-n">${people.filter(p=>['登録済み','初期育成','活動中'].includes(p.stage)).length}</div></div><div class="stat"><div class="stat-label">期限が来た次の行動</div><div class="stat-n">${countDue()}</div></div></div><div class="card card-pad"><div class="toolbar"><input id="search" class="input search" aria-label="名前で検索" placeholder="🔎 名前・担当者で検索" value="${esc(ui.search)}"><select id="filter" class="select" aria-label="状況で絞り込み">${['すべて','ゲスト','登録済み','活動中','要対応'].map(s=>`<option ${ui.filter===s?'selected':''}>${s}</option>`).join('')}</select></div><div id="people-list" class="people"></div></div><div class="note notice-warn" style="margin-top:17px">🔒 <b>データの保存について：</b> クラウドに接続するまでは端末内保存です。「設定」からGoogleにログインし、クラウドデータを読み込むと同期を開始できます。</div>`}
+function renderSettings(){return `<header class="topbar"><div><div class="eyebrow">RE:RISE Manager</div><h1 class="heading">設定</h1><div class="subheading">データの管理とアプリの確認。</div></div></header><div class="card card-pad"><div class="section-title">データのバックアップ</div><div class="section-note">保存済みの情報を書き出したり、以前のバックアップを読み込めます。</div><button class="btn primary" style="margin-top:17px" data-action="backup">バックアップ・データ取り込み</button></div><div class="note notice-warn" style="margin-top:17px"><b>データの安全性について：</b> クラウドを有効化するまでは端末内にだけ保存されます。共有アクセスはGoogleスプレッドシートの共有権限に従います。バックアップファイルは暗号化されません。</div><div class="note" style="margin-top:12px">アプリ：RE:RISE Manager v1.5（iPhoneホーム画面対応・端末内保存）</div>${renderCloudSettings()}`}
 function renderPeople(){const out=document.getElementById('people-list');if(!out)return;const today=new Date().toLocaleDateString('sv-SE');const arr=people.filter(p=>{const hay=[p.name,p.owner,p.introducer].join(' ').toLowerCase();if(!hay.includes(ui.search.toLowerCase()))return false;if(ui.filter==='ゲスト')return ['アポ前','アポ調整中','説明後'].includes(p.stage);if(ui.filter==='登録済み')return ['登録済み','初期育成'].includes(p.stage);if(ui.filter==='活動中')return p.stage==='活動中';if(ui.filter==='要対応')return p.nextAction&&p.nextDate&&p.nextDate<=today;return true});out.innerHTML=arr.length?arr.map(p=>`<button class="person" data-action="open-person" data-id="${esc(p.id)}"><div class="avatar">${esc(initials(p.name))}</div><div class="person-body"><div class="person-name">${esc(p.name)} ${badge(p.stage)}</div><div class="person-next">${esc(p.nextAction?'次：'+p.nextAction:'次のアクション未設定')}${p.nextDate?' · '+esc(dstr(p.nextDate)):''}</div><div class="person-owner">担当：${esc(p.owner||'未設定')}　/ 紹介者：${esc(p.introducer||'未設定')}</div></div><span class="chevron">›</span></button>`).join(''):`<div class="empty"><h3>該当する人物がいません</h3><div>検索や絞り込み条件を変更してください。</div></div>`}
 function renderDetail(p){return `<div class="back"><button class="btn ghost small" data-action="go-list">〈 人物一覧へ</button></div><div class="detail-head"><div><div class="eyebrow">PERSON PROFILE</div><div class="detail-name">${esc(p.name)}</div><div class="detail-caption">担当：${esc(p.owner||'未設定')}　/ 紹介者：${esc(p.introducer||'未設定')}</div></div>${badge(p.stage)}</div><div class="tabbar"><button class="tab ${ui.view==='sheet'?'active':''}" data-action="go-sheet">▤ 4種類のゲストシート</button><button class="tab ${ui.view==='progress'?'active':''}" data-action="go-progress">◉ 活動進捗</button></div>${ui.view==='sheet'?renderSheets(p):renderProgress(p)}<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:22px"><button class="btn small" data-action="go-list">〈 一覧に戻る</button><button class="btn small danger" data-action="delete-person">この人物を削除</button></div>`}
 function renderSheets(p){const s=SHEETS.find(s=>s.id===ui.sheet);const arr=fields[ui.sheet];return `<div class="card card-pad"><div class="section-title">ゲストシート</div><div class="section-note">人物の共通情報は4種類すべてに自動反映されます。</div><div class="sheet-grid">${SHEETS.map(t=>`<button class="sheet-tab ${ui.sheet===t.id?'active':''}" data-action="sheet-type" data-id="${t.id}"><span class="sheet-icon">${t.icon}</span>${t.short}</button>`).join('')}</div><div class="sheet-toolbar"><div><strong>${s.icon} ${s.title}</strong><div class="small-muted">${arr.length}項目・紹介者を含む</div></div><div class="segmented"><button class="btn ${ui.mode==='edit'?'active':''}" data-action="mode" data-id="edit">編集</button><button class="btn ${ui.mode==='preview'?'active':''}" data-action="mode" data-id="preview">プレビュー</button></div></div>${ui.mode==='edit'?renderSheetEdit(p,arr):`<div class="sheet-preview" id="sheet-preview">${esc(sheetText(p,ui.sheet))}</div>`}<hr class="line"><div class="field-grid" style="margin-bottom:15px"><div class="field"><label for="introducer">紹介者（全シート共通）</label><input class="input" id="introducer" data-field="introducer" value="${esc(p.introducer||'')}" placeholder="紹介者名"></div><div class="field"><label for="owner">担当者（管理用）</label><input class="input" id="owner" data-field="owner" value="${esc(p.owner||'')}" placeholder="担当者名"></div></div><div class="actionrow"><button class="btn primary" data-action="copy-sheet">▤ シート全文をコピー</button><button class="btn dark" data-action="share-sheet">↗ LINE等で共有</button><button class="btn" data-action="record-send">✓ 送信済みを記録</button></div><div class="history">${historyText(p,ui.sheet)}</div><div class="note" style="margin-top:14px">共有ボタンは端末の共有メニューを開きます。LINEへの実際の送信は自分で行います。「送信済みを記録」は送ったことを確認してから押してください。</div></div>`}
@@ -152,6 +255,10 @@ document.addEventListener('click',async e=>{if(e.target.dataset.backdrop){closeM
  if(a==='new-person'){newPersonModal();return}
  if(a==='close-modal'){closeModal();return}
  if(a==='backup'){backupModal();return}
+ if(a==='cloud-config'){cloudConfigSave();return}
+ if(a==='cloud-login'){cloudSignIn();return}
+ if(a==='cloud-pull'){await cloudPull();return}
+ if(a==='cloud-flush'){if(!cloud.ready){toast('先にクラウドから読み込んでください');return}await cloudFlush();return}
  if(a==='open-person'){ui.personId=b.dataset.id;ui.sheet='new';ui.mode='edit';changeView('sheet');return}
  if(a==='sheet-type'){ui.sheet=b.dataset.id;ui.mode='edit';render();return}
  if(a==='mode'){ui.mode=b.dataset.id;render();return}
