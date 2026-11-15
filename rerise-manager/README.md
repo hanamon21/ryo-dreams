@@ -1,14 +1,12 @@
-# RE:RISE Manager v1.6
+# RE:RISE Manager v1.7 / データ保護改善版
 
-GitHub Pages 用PWA。公開リポジトリにはゲストデータを含めません。
+GitHubにはアプリ本体だけを公開。人物データと認証トークンは含まない。
 
-Google Sheets cloud sync:
-1. Private Google Sheet `People`: columns `person_id, name, stage, updated_at, person_json, owner`.
-2. Google Cloud Console: create OAuth client type **Web application**; authorized JS origin `https://hanamon21.github.io`; add the `https://www.googleapis.com/auth/spreadsheets` scope and allowed test accounts if necessary.
-3. Configure OAuth client ID in app **設定** then click Google login > cloud pull.
+- 端末保存済み・クラウド同期済みをアプリ上部に表示。
+- 端末への即時保存と、未同期差分の継続検知。
+- 最終同期時点のスナップショットを保持し、アプリ再起動後も編集差分を検出。
+- Googleに再接続すると3者（前回同期・端末・クラウド）を比較。別フィールドは統合し、衝突時は手動選択。
+- v1.6 の旧バックアップも「設定 → 過去の入力を復元」から確認。
+- Google OAuthの強制的な再同意（prompt=consent）を解除。
 
-Google Cloud authorization and Google Drive sharing are controlled by sheet owner. OAuth tokens are memory-only. No untrusted users can view data just by knowing the sheet ID.
-
-If another device changes the same person, the app stops synchronization rather than silently overwriting the concurrent update.
-
-UI v1.6: five status categories (アポ前 / ご案内中 / 登録済み / 活動中 / 見送り). Legacy stages are shown as mapped labels without modifying existing cloud records.
+**制限**: ブラウザのGoogleトークン方式では、再起動後も操作なしでログインを保持することはできません。認証ボタンは引き続き必要です。未同期データはこの端末に保存されますが、ブラウザデータを消去すると失われます。重要な変更はJSONバックアップも取ってください。 Google Sheetsは厳密なトランザクション機能がないため、同時書込の競合を完全には防止できません。

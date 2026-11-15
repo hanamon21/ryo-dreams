@@ -41,6 +41,11 @@
   @media(max-width:700px){.stage-tabs{grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.stage-tab{font-size:12px;min-height:44px}}
   @media(max-width:370px){.stage-tab{gap:3px;font-size:11px}.stage-count{font-size:10px;padding:0 5px;min-width:20px}}
   @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+  .sync-banner{border:1px solid #bbd6ce;border-radius:14px;background:#e9f7f0;padding:13px 15px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;gap:12px;box-shadow:var(--shadow)}
+  .sync-banner.warn{background:#fff2df;border-color:#e8c99a}.sync-banner.error{background:#fff0f0;border-color:#e8b7b7}
+  .sync-banner .sync-main{min-width:0}.sync-banner .sync-label{display:block;font-size:13px;font-weight:850;color:#185b49}.sync-banner.warn .sync-label{color:#865615}.sync-banner.error .sync-label{color:#a33a3a}
+  .sync-banner .sync-detail{font-size:11px;color:#657b7b;margin-top:2px}.sync-banner .btn{font-size:12px;padding:7px 11px;min-height:35px}
+  @media(max-width:590px){.sync-banner{padding:11px;gap:8px;flex-wrap:wrap}.sync-banner .btn{width:100%}}
   </style>
 </head>
 <body>
@@ -51,7 +56,7 @@
 <script>
 (()=>{'use strict';
 const STORE_KEY='rerise.manager.mvp.v1';
-const APP_VERSION='1.6';
+const APP_VERSION='1.7';
 // Five simple statuses. Existing cloud records keep their original status until edited.
 const STAGES=['アポ前','ご案内中','登録済み','活動中','見送り'];
 const LIST_FILTERS=['すべて',...STAGES];
@@ -71,106 +76,309 @@ const fields={
 };
 const CHECKS=[['registered','新規登録'],['fellow','フェロートレーニング'],['miho','花井美穂さんとの面談'],['list100','100人リスト'],['dream','夢リスト'],['outreach','声かけ・連絡'],['marketing','マーケティング練習'],['meeting','打ち合わせ'],['report','活動報告']];
 
-// Cloud data: private Google Sheet accessed with the signed-in user's short-lived OAuth token.
+// Data safety v1.7: local edits are saved immediately and compared against a durable
+// last-synced snapshot. Auth tokens are deliberately NOT persisted in localStorage.
 const CLOUD_SETTINGS_KEY='rerise.manager.cloud.v1';
+const CLOUD_BASE_KEY='rerise.manager.cloud.base.v17';
+const CLOUD_BACKUPS_KEY='rerise.manager.cloud.recovery.v17';
 const CLOUD_DEFAULT_ID='19i7zJ7bDYrlB4MWGW23r9UlLr-f8DKsqRztylSzKR6M';
 const cloudSaved=(()=>{try{return JSON.parse(localStorage.getItem(CLOUD_SETTINGS_KEY)||'{}')}catch{return {}}})();
-const cloud={clientId:cloudSaved.clientId||'',spreadsheetId:cloudSaved.spreadsheetId||CLOUD_DEFAULT_ID,accessToken:'',state:'未接続',ready:false,rows:new Map(),snapshots:new Map(),timer:null,busy:false,dirtyCounter:0,pendingConflicts:[]};
+const cloud={clientId:cloudSaved.clientId||'',spreadsheetId:cloudSaved.spreadsheetId||CLOUD_DEFAULT_ID,accessToken:'',state:'未接続',ready:false,rows:new Map(),snapshots:new Map(),baselineKnown:false,lastSuccessAt:'',timer:null,busy:false,dirtyCounter:0,pendingConflicts:[],resolutionRemote:null,reconciledDraft:null};
 const API='https://sheets.googleapis.com/v4/spreadsheets/';
 const CLOUD_SHEET='People';
-function cloudMessage(){return cloud.ready?'同期中'+(cloud.busy?'…':'（自動同期ON）'):cloud.accessToken?'Google認証済み・未読み込み':'未接続（端末内保存）'}
-function cloudConfigSave(){let id=document.getElementById('google-client-id')?.value.trim()||'';let sid=document.getElementById('google-sheet-id')?.value.trim()||'';sid=sid.match(/\/spreadsheets\/d\/([A-Za-z0-9_-]+)/)?.[1]||sid;if(sid&&!/^[A-Za-z0-9_-]{20,}$/.test(sid)){toast('スプレッドシートIDが正しくありません');return}if(id&&!/^[0-9]+-[a-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id)){toast('Google OAuthクライアントIDを確認してください');return}if(cloud.accessToken&&cloud.spreadsheetId!==sid){cloud.accessToken='';cloud.ready=false;}cloud.clientId=id;cloud.spreadsheetId=sid||CLOUD_DEFAULT_ID;localStorage.setItem(CLOUD_SETTINGS_KEY,JSON.stringify({clientId:cloud.clientId,spreadsheetId:cloud.spreadsheetId}));toast('Google連携設定を保存しました');render()}
+function restoreCloudBaseline(){
+ try{
+  const j=JSON.parse(localStorage.getItem(CLOUD_BASE_KEY)||'null');
+  if(j?.spreadsheetId===cloud.spreadsheetId&&Array.isArray(j.snapshots)){
+   cloud.snapshots=new Map(j.snapshots);cloud.baselineKnown=true;cloud.lastSuccessAt=j.at||'';
+  }else{cloud.snapshots=new Map();cloud.baselineKnown=false;cloud.lastSuccessAt=''}
+ }catch{cloud.snapshots=new Map();cloud.baselineKnown=false}
+}
+restoreCloudBaseline();
+function persistCloudBaseline(){
+ try{localStorage.setItem(CLOUD_BASE_KEY,JSON.stringify({spreadsheetId:cloud.spreadsheetId,at:cloud.lastSuccessAt,snapshots:[...cloud.snapshots]}))}
+ catch(e){toast('同期記録を端末に保存できません。バックアップを確認してください。')}
+}
+function pendingIds(){
+ if(!cloud.baselineKnown)return people.map(p=>p.id);
+ const a=new Map(people.map(p=>[p.id,JSON.stringify(p)]));
+ const keys=new Set([...a.keys(),...cloud.snapshots.keys()]);
+ return [...keys].filter(id=>a.get(id)!==cloud.snapshots.get(id));
+}
+function pendingCount(){return pendingIds().length}
+function cloudMessage(){
+ const n=pendingCount();
+ if(cloud.pendingConflicts.length)return `⚠ 編集の競合 ${cloud.pendingConflicts.length}名・未同期データは端末に保存中`;
+ if(cloud.busy&&cloud.ready)return `⏳ Googleに保存中${n?`（${n}名）`:''}`;
+ if(!cloud.accessToken)return `⚠ ${n?`端末保存済み・クラウド未同期 ${n}名`:'Google未接続・端末保存のみ'}`;
+ if(!cloud.ready)return `⚠ Google認証済み・接続確認中${n?`（未同期 ${n}名）`:''}`;
+ if(n)return `⚠ 端末保存済み・クラウド未同期 ${n}名`;
+ return '✓ Googleクラウドに保存済み';
+}
+function cloudBanner(){
+ const n=pendingCount(),warn=!cloud.ready||n>0||cloud.pendingConflicts.length;
+ const act=cloud.pendingConflicts.length?'sync-resolve':!cloud.accessToken?'cloud-login':!cloud.ready?'cloud-pull':n?'cloud-flush':'';
+ const action=cloud.pendingConflicts.length?'競合を解決':!cloud.accessToken?'Googleに再接続':!cloud.ready?'接続・差分確認':n?'今すぐ同期':'';
+ const detail=cloud.ready&&n===0&&cloud.lastSuccessAt?'最終確認：'+new Date(cloud.lastSuccessAt).toLocaleString('ja-JP'):'端末内に自動保存。Googleに反映されるまで消さないでください';
+ return `<div id="sync-banner" class="sync-banner ${warn?'warn':''}" role="status" aria-live="polite"><div class="sync-main"><span id="sync-label" class="sync-label">${esc(cloudMessage())}</span><div class="sync-detail" id="sync-detail">${esc(detail)}</div></div><button id="sync-action" data-action="${esc(act||'go-settings')}" class="btn small ${act?'':'hidden'}">${esc(action)}</button></div>`
+}
+function updateSyncBanner(){
+ const node=document.getElementById('sync-banner');if(!node)return;
+ const n=pendingCount(),warn=!cloud.ready||n>0||cloud.pendingConflicts.length;
+ node.classList.toggle('warn',Boolean(warn));
+ const label=document.getElementById('sync-label');if(label)label.textContent=cloudMessage();
+ const detail=document.getElementById('sync-detail');if(detail)detail.textContent=cloud.ready&&n===0&&cloud.lastSuccessAt?'最終確認：'+new Date(cloud.lastSuccessAt).toLocaleString('ja-JP'):'端末内には保存済み。クラウドへの保存が完了するまで保護します';
+ const button=document.getElementById('sync-action');
+ if(button){
+  const act=cloud.pendingConflicts.length?'sync-resolve':!cloud.accessToken?'cloud-login':!cloud.ready?'cloud-pull':n?'cloud-flush':'';
+  button.dataset.action=act||'go-settings';button.textContent=cloud.pendingConflicts.length?'競合を解決':!cloud.accessToken?'Googleに再接続':!cloud.ready?'接続・差分確認':n?'今すぐ同期':'';
+  button.classList.toggle('hidden',!act);
+ }
+}
+function recoveryBackup(reason){
+ try{
+  const raw=localStorage.getItem(CLOUD_BACKUPS_KEY);const items=raw?JSON.parse(raw):[];
+  items.unshift({at:new Date().toISOString(),reason,people:structuredClone(people)});
+  localStorage.setItem(CLOUD_BACKUPS_KEY,JSON.stringify(items.slice(0,4)));
+ }catch(e){toast('自動バックアップ容量に注意。JSONの書き出しも利用してください。')}
+}
+function cloudConfigSave(){
+ let id=document.getElementById('google-client-id')?.value.trim()||'';let sid=document.getElementById('google-sheet-id')?.value.trim()||'';
+ sid=sid.match(/\/spreadsheets\/d\/([A-Za-z0-9_-]+)/)?.[1]||sid;
+ if(sid&&!/^[A-Za-z0-9_-]{20,}$/.test(sid)){toast('スプレッドシートIDが正しくありません');return}
+ if(id&&!/^[0-9]+-[a-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id)){toast('Google OAuthクライアントIDを確認してください');return}
+ if(cloud.spreadsheetId!==sid||cloud.clientId!==id){cloud.accessToken='';cloud.ready=false;cloud.pendingConflicts=[]}
+ cloud.clientId=id;cloud.spreadsheetId=sid||CLOUD_DEFAULT_ID;
+ localStorage.setItem(CLOUD_SETTINGS_KEY,JSON.stringify({clientId:cloud.clientId,spreadsheetId:cloud.spreadsheetId}));
+ restoreCloudBaseline();toast('Google連携設定を保存しました');render();
+}
 function cloudSignIn(){
- if(!cloud.clientId){toast('先にGoogle OAuthクライアントIDを設定・保存してください');return}
- if(!window.google?.accounts?.oauth2){toast('Google認証ライブラリを読み込めません。通信環境をご確認ください');return}
+ if(!cloud.clientId){toast('先にGoogle OAuthクライアントIDを設定してください');changeView('settings');return}
+ if(!window.google?.accounts?.oauth2){toast('Google認証ライブラリを読み込めません。通信環境を確認してください');return}
  const auth=google.accounts.oauth2.initTokenClient({client_id:cloud.clientId,scope:'https://www.googleapis.com/auth/spreadsheets',callback:async response=>{
-   if(response.error||!response.access_token){toast('Google認証に失敗しました');return}
-   cloud.accessToken=response.access_token;cloud.ready=false;cloud.state='認証済み';
-   toast('Google認証が完了しました。');render();if(!people.length)await cloudPull();
- },error_callback:()=>toast('Google認証がキャンセルされました')});
- auth.requestAccessToken({prompt:'consent'});
+  if(response.error||!response.access_token){toast('Google認証に失敗しました');return}
+  cloud.accessToken=response.access_token;cloud.ready=false;cloud.state='認証済み';
+  updateSyncBanner();toast('Google認証完了。未同期の編集を確認しています。');
+  await cloudPull();
+ },error_callback:()=>toast('認証がキャンセルされました。端末の入力は保存されています。')});
+ // Empty prompt reuses an existing grant where possible. User interaction is still required.
+ auth.requestAccessToken({prompt:''});
 }
 function cloudUrl(range){if(!cloud.spreadsheetId)throw Error('シートID未設定');return API+encodeURIComponent(cloud.spreadsheetId)+'/values/'+encodeURIComponent(range)}
 async function cloudRequest(url,opts={}){
- if(!cloud.accessToken)throw Error('Google認証が必要です');
+ if(!cloud.accessToken)throw Error('Googleへの再接続が必要です');
  const response=await fetch(url,{...opts,headers:{Authorization:'Bearer '+cloud.accessToken,...(opts.body?{'Content-Type':'application/json'}:{}),...(opts.headers||{})},cache:'no-store'});
  const payload=await response.json().catch(()=>({}));
- if(!response.ok){if(response.status===401){cloud.ready=false;cloud.accessToken=''}throw Error(response.status===403?'シートへのアクセス権限がありません。共有設定を確認してください':(payload.error?.message||'Google APIエラー '+response.status))}
+ if(!response.ok){if(response.status===401){cloud.ready=false;cloud.accessToken=''}throw Error(response.status===403?'Googleシートへのアクセス権限を確認してください':(payload.error?.message||'Google APIエラー '+response.status))}
  return payload;
 }
 async function cloudReadRows(){
  const x=await cloudRequest(cloudUrl(CLOUD_SHEET+'!A1:F3000'));
  const arr=x.values||[];
  if(arr.length===0||arr[0][0]!=='person_id'||arr[0][4]!=='person_json')throw Error('Peopleシートの列が一致しません');
- const found=[];const rows=new Map();const snapshots=new Map();
+ const found=[],rows=new Map(),snapshots=new Map();
  for(let i=1;i<arr.length;i++){
   const row=arr[i];if(!row?.[0]||!row?.[4])continue;
   let p;try{p=JSON.parse(row[4])}catch{throw Error(`${i+1}行目のJSONが正しくありません`)}
-  if(p.id!==row[0]||!p.name)throw Error(`${i+1}行目の人物IDに不整合があります`);
-  if(rows.has(p.id))throw Error('重複する人物ID：'+p.id);
+  if(p.id!==row[0]||!p.name)throw Error(`${i+1}行目の人物IDが一致しません`);
+  if(rows.has(p.id))throw Error('人物IDが重複しています：'+p.id);
   found.push(p);rows.set(p.id,i+1);snapshots.set(p.id,JSON.stringify(p));
  }
  return {people:found,rows,snapshots};
 }
-async function cloudPull(){
- if(!cloud.accessToken){toast('Googleにログインしてください');return}
- if(cloud.ready&&cloud.dirtyCounter>0&&cloud.busy){toast('同期処理中です');return}
- if(people.length&&!confirm('クラウドの人物情報で現在の画面を置き換えます。端末内の現在の情報は自動バックアップしてから読み込みます。よろしいですか？'))return;
- try{
-  cloud.state='読み込み中';const result=await cloudReadRows();
-  localStorage.setItem('rerise.manager.pre-cloud-backup.'+Date.now(),JSON.stringify(people));
-  people=result.people;cloud.rows=result.rows;cloud.snapshots=result.snapshots;cloud.ready=true;cloud.dirtyCounter=0;cloud.pendingConflicts=[];
-  localStorage.setItem(STORE_KEY,JSON.stringify(people));ui.view='list';ui.personId=null;ui.filter='すべて';cloud.state='接続済み';render();toast(`${people.length}名をクラウドから読み込みました。編集は自動同期されます。`);
- }catch(err){cloud.ready=false;cloud.state='読み込みエラー';toast('読み込み失敗：'+err.message)}
+function same(a,b){return JSON.stringify(a)===JSON.stringify(b)}
+function plain(o){return o&&typeof o==='object'&&!Array.isArray(o)}
+const MISSING=Symbol('missing');
+function smartMerge(base,local,remote,path=''){
+ if(same(local,remote))return {value:local,conflicts:[]};
+ if(same(local,base))return {value:remote,conflicts:[]};
+ if(same(remote,base))return {value:local,conflicts:[]};
+ if(path==='updatedAt')return {value:String(local||'')>String(remote||'')?local:remote,conflicts:[]};
+ if(plain(local)&&plain(remote)&&plain(base)){
+  const combined={},conflicts=[];
+  for(const k of new Set([...Object.keys(base),...Object.keys(local),...Object.keys(remote)])){
+   const a=Object.hasOwn(base,k)?base[k]:MISSING;
+   const b=Object.hasOwn(local,k)?local[k]:MISSING;
+   const c=Object.hasOwn(remote,k)?remote[k]:MISSING;
+   const next=smartMerge(a,b,c,k);
+   conflicts.push(...next.conflicts.map(x=>path?path+'.'+x:x));
+   if(next.value!==MISSING)combined[k]=next.value;
+  }
+  return {value:combined,conflicts};
+ }
+ return {value:local,conflicts:[path||'データ']};
 }
-function cloudSchedule(){if(!cloud.ready)return;cloud.dirtyCounter++;clearTimeout(cloud.timer);cloud.timer=setTimeout(()=>cloudFlush(),1800)}
+function reconcileRecords(remote){
+ const local=new Map(people.map(p=>[p.id,p]));
+ const online=new Map(remote.people.map(p=>[p.id,p]));
+ const ids=[...new Set([...online.keys(),...local.keys(),...cloud.snapshots.keys()])];
+ const merged=new Map(),conflicts=[];
+ for(const id of ids){
+  const a=cloud.baselineKnown?(cloud.snapshots.has(id)?JSON.parse(cloud.snapshots.get(id)):MISSING):MISSING;
+  const b=local.has(id)?local.get(id):MISSING;
+  const c=online.has(id)?online.get(id):MISSING;
+  if(b===MISSING&&a===MISSING){if(c!==MISSING)merged.set(id,c);continue}
+  if(c===MISSING&&a===MISSING){if(b!==MISSING)merged.set(id,b);continue}
+  if(!cloud.baselineKnown){
+   if(same(b,c)){if(c!==MISSING)merged.set(id,c);continue}
+   conflicts.push({id,name:(b!==MISSING?b.name:c.name)||id,local:b===MISSING?null:b,remote:c===MISSING?null:c,keys:['初回の差分（保存先が未確認）']});
+   if(b!==MISSING)merged.set(id,b);continue;
+  }
+  const result=smartMerge(a,b,c);
+  if(result.conflicts.length){
+   conflicts.push({id,name:(b!==MISSING?b.name:c!==MISSING?c.name:id),local:b===MISSING?null:b,remote:c===MISSING?null:c,keys:result.conflicts});
+   if(b!==MISSING)merged.set(id,b);
+  }else if(result.value!==MISSING)merged.set(id,result.value);
+ }
+ return {records:[...merged.values()],conflicts};
+}
+async function cloudPull(){
+ if(!cloud.accessToken){toast('Googleへ再接続してください。端末の編集は保持します。');updateSyncBanner();return}
+ if(cloud.busy)return;
+ cloud.busy=true;cloud.state='照合中';updateSyncBanner();
+ try{
+  const remote=await cloudReadRows();
+  const merged=reconcileRecords(remote);
+  if(merged.conflicts.length){
+   cloud.ready=false;cloud.state='競合あり';cloud.pendingConflicts=merged.conflicts;cloud.resolutionRemote=remote;cloud.reconciledDraft=merged.records;
+   updateSyncBanner();toast(`${merged.conflicts.length}名分の差分を確認してください。保存内容は消していません。`);
+   showCloudConflicts();return;
+  }
+  if(!same(people,merged.records))recoveryBackup('クラウド差分の自動取り込み前');
+  people=merged.records;cloud.rows=remote.rows;cloud.snapshots=remote.snapshots;cloud.baselineKnown=true;cloud.ready=true;cloud.pendingConflicts=[];cloud.resolutionRemote=null;
+  localStorage.setItem(STORE_KEY,JSON.stringify(people));cloud.lastSuccessAt=new Date().toISOString();persistCloudBaseline();
+  cloud.state='接続済み';render();
+  if(pendingCount()){
+   toast('クラウドと照合完了。端末の未同期編集を保存しています。');
+   cloud.dirtyCounter++;setTimeout(()=>cloudFlush(),250);
+  }else toast(`クラウドと同期しました（${people.length}名）。`);
+ }catch(err){cloud.ready=false;cloud.state='照合エラー';toast('クラウド接続エラー：'+err.message+'。端末の編集は保持中。');updateSyncBanner()}
+ finally{cloud.busy=false;updateSyncBanner()}
+}
+function showCloudConflicts(){
+ if(!cloud.pendingConflicts.length){toast('競合はありません');return}
+ const blocks=cloud.pendingConflicts.map(c=>`<div class="note notice-warn" style="margin-top:12px"><b>${esc(c.name)}</b><div class="small-muted">差分：${esc(c.keys.slice(0,7).join('、'))}</div><div class="actionrow" style="margin-top:10px"><button class="btn small" data-action="resolve-local" data-id="${esc(c.id)}">この端末を採用</button><button class="btn small" data-action="resolve-remote" data-id="${esc(c.id)}">クラウドを採用</button></div></div>`).join('');
+ openModal(`<h2>⚠ 同期の競合を確認</h2><p class="small-muted">内容の違う人物を自動で上書きしません。採用前の端末データは自動バックアップします。「この端末を採用」はクラウド内容を上書きする可能性があります。</p>${blocks}<div class="modal-actions"><button class="btn" data-action="close-modal">後で解決</button></div>`);
+}
+function resolveCloudConflict(id,choice){
+ const c=cloud.pendingConflicts.find(x=>x.id===id);if(!c||!cloud.resolutionRemote||!cloud.reconciledDraft)return;
+ const draft=cloud.reconciledDraft;
+ const pos=draft.findIndex(p=>p.id===id);
+ const choiceValue=choice==='remote'?c.remote:c.local;
+ if(choiceValue){if(pos>=0)draft[pos]=structuredClone(choiceValue);else draft.push(structuredClone(choiceValue))}
+ else if(pos>=0)draft.splice(pos,1);
+ cloud.pendingConflicts=cloud.pendingConflicts.filter(x=>x.id!==id);
+ if(!cloud.pendingConflicts.length){
+  recoveryBackup('競合解決とクラウド照合の前');
+  people=draft;localStorage.setItem(STORE_KEY,JSON.stringify(people));
+  const rem=cloud.resolutionRemote;
+  cloud.rows=rem.rows;cloud.snapshots=rem.snapshots;cloud.baselineKnown=true;cloud.ready=true;
+  cloud.resolutionRemote=null;cloud.reconciledDraft=null;
+  cloud.lastSuccessAt=new Date().toISOString();persistCloudBaseline();
+  render();closeModal();
+  if(pendingCount()){cloud.dirtyCounter++;setTimeout(()=>cloudFlush(),100)}
+  else toast('差分を確認してクラウドと一致しました');
+ }else showCloudConflicts();
+ updateSyncBanner();
+}
+function listRecovery(){
+ const list=[];
+ try{
+  const stored=JSON.parse(localStorage.getItem(CLOUD_BACKUPS_KEY)||'[]');
+  for(let i=0;i<stored.length;i++)if(Array.isArray(stored[i]?.people))list.push({key:'safe',idx:i,...stored[i]});
+  for(let i=0;i<localStorage.length;i++){
+   const key=localStorage.key(i);if(!key?.startsWith('rerise.manager.pre-cloud-backup.'))continue;
+   const val=JSON.parse(localStorage.getItem(key)||'null');if(!Array.isArray(val))continue;
+   list.push({key,idx:0,at:new Date(Number(key.split('.').pop())).toISOString(),reason:'以前のクラウド読み込み前',people:val});
+  }
+ }catch(e){toast('バックアップの読込に失敗しました')}
+ return list.sort((a,b)=>String(b.at).localeCompare(String(a.at))).slice(0,25);
+}
+function showRecovery(){
+ const list=listRecovery();
+ if(!list.length){openModal('<h2>復旧バックアップ</h2><p>この端末には復旧用バックアップが見つかりませんでした。</p><button class="btn" data-action="close-modal">閉じる</button>');return}
+ const buttons=list.map((item,i)=>`<div class="note" style="margin-top:10px"><b>${esc(new Date(item.at).toLocaleString('ja-JP'))}</b>　${item.people.length}名<div class="small-muted">${esc(item.reason||'端末の記録')}</div><button class="btn small" style="margin-top:8px" data-action="restore-snapshot" data-ref="${i}">この時点のデータを復元</button></div>`).join('');
+ openModal(`<h2>以前の入力を復元</h2><p class="small-muted">過去のアプリがクラウドを読み込む直前に保存した内容も対象です。復元前に現在の内容もバックアップします。</p>${buttons}<div class="modal-actions"><button class="btn" data-action="close-modal">閉じる</button></div>`);
+}
+function restoreSnapshot(index){
+ const selected=listRecovery()[index];if(!selected)return;
+ if(!confirm(`${selected.people.length}名分の端末データを復元しますか？
+現在の内容は復旧用バックアップへ退避します。復元後、Googleへの自動同期は一旦停止します。`))return;
+ recoveryBackup('手動復元前');
+ people=structuredClone(selected.people);localStorage.setItem(STORE_KEY,JSON.stringify(people));
+ cloud.ready=false;cloud.pendingConflicts=[];cloud.resolutionRemote=null;cloud.reconciledDraft=null;
+ ui.view='list';ui.personId=null;ui.filter='すべて';closeModal();render();
+ toast('端末データを復元しました。Googleに再接続して差分を確認してください。');
+}
+function cloudSchedule(){
+ if(cloud.pendingConflicts.length){cloud.pendingConflicts=[];cloud.resolutionRemote=null;cloud.reconciledDraft=null;cloud.ready=false;cloud.state='差分の再確認が必要'}
+ cloud.dirtyCounter++;
+ updateSyncBanner();
+ if(!cloud.ready||!cloud.accessToken)return;
+ clearTimeout(cloud.timer);cloud.timer=setTimeout(()=>cloudFlush(),1100);
+}
 async function cloudFlush(){
- if(!cloud.ready||!cloud.accessToken||cloud.busy)return;
- cloud.busy=true;const revision=cloud.dirtyCounter;
+ if(!cloud.ready||!cloud.accessToken){updateSyncBanner();return}
+ if(cloud.busy){clearTimeout(cloud.timer);cloud.timer=setTimeout(()=>cloudFlush(),1200);return}
+ cloud.busy=true;const rev=cloud.dirtyCounter;updateSyncBanner();
  try{
   const current=await cloudReadRows();
   const local=new Map(people.map(p=>[p.id,p]));
-  const prev=cloud.snapshots;
-  const edits=[];const newRows=[];const conflicts=[];
-  const stale=[];
-  // This compares every known row against the last successfully synchronized version.
-  // If another editor changed the same person remotely, do not overwrite their data.
+  const edits=[],newRows=[],conflicts=[];
   for(const [id,record] of local){
-   const serialized=JSON.stringify(record);
-   if(prev.has(id)&&prev.get(id)===serialized)continue;
-   if(current.snapshots.has(id)){
-    if(prev.has(id)&&prev.get(id)!==current.snapshots.get(id)){conflicts.push(record.name);continue}
-    const rowIndex=current.rows.get(id);
-    edits.push({range:`'${CLOUD_SHEET}'!A${rowIndex}:F${rowIndex}`,values:[[id,record.name,record.stage||'',record.updatedAt||'',serialized,record.owner||'']]});
-   }else if(!prev.has(id)){
-    newRows.push([id,record.name,record.stage||'',record.updatedAt||'',serialized,record.owner||'']);
-   }else conflicts.push(record.name);
+   const serialized=JSON.stringify(record),base=cloud.snapshots.get(id),remote=current.snapshots.get(id);
+   if(base===serialized)continue;
+   if(remote!==base&&remote!==serialized){conflicts.push(record.name);continue}
+   if(current.rows.has(id)){
+    edits.push({range:`'${CLOUD_SHEET}'!A${current.rows.get(id)}:F${current.rows.get(id)}`,values:[[id,record.name,record.stage||'',record.updatedAt||'',serialized,record.owner||'']]});
+   }else if(base===undefined)newRows.push([id,record.name,record.stage||'',record.updatedAt||'',serialized,record.owner||'']);
+   else conflicts.push(record.name);
   }
-  for(const [id,serialized] of prev){
+  for(const [id,base] of cloud.snapshots){
    if(local.has(id))continue;
-   if(current.snapshots.has(id)&&current.snapshots.get(id)!==serialized){conflicts.push(id);continue}
-   if(current.rows.has(id)){const n=current.rows.get(id);edits.push({range:`'${CLOUD_SHEET}'!A${n}:F${n}`,values:[['','','','','','']]});stale.push(id)}
+   const remote=current.snapshots.get(id);
+   if(remote!==base){conflicts.push(id);continue}
+   if(current.rows.has(id)){const n=current.rows.get(id);edits.push({range:`'${CLOUD_SHEET}'!A${n}:F${n}`,values:[['','','','','','']]})}
   }
-  if(conflicts.length){cloud.pendingConflicts=conflicts;cloud.state='競合あり';toast('他の端末で同じ人物が更新されています：'+conflicts.join('、')+'。クラウドから読み込み直してください。');return}
-  if(edits.length){await cloudRequest(API+encodeURIComponent(cloud.spreadsheetId)+'/values:batchUpdate',{method:'POST',body:JSON.stringify({valueInputOption:'RAW',data:edits})})}
-  if(newRows.length){await cloudRequest(cloudUrl(CLOUD_SHEET+'!A:F')+':append?valueInputOption=RAW&insertDataOption=INSERT_ROWS',{method:'POST',body:JSON.stringify({values:newRows})})}
-  const refreshed=await cloudReadRows();cloud.rows=refreshed.rows;cloud.snapshots=refreshed.snapshots;cloud.state='接続済み';cloud.pendingConflicts=[];
-  if(edits.length||newRows.length)toast('クラウドへ同期しました');
- }catch(err){cloud.state='同期エラー';toast('同期できませんでした：'+err.message)}
- finally{cloud.busy=false;if(cloud.ready&&cloud.dirtyCounter!==revision)cloudSchedule();}
+  if(conflicts.length){
+   cloud.state='競合あり';cloud.ready=false;
+   toast('他端末の更新と重複しています。端末データはそのまま保存しています。差分確認が必要です。');
+   setTimeout(()=>cloudPull(),100);return;
+  }
+  if(edits.length)await cloudRequest(API+encodeURIComponent(cloud.spreadsheetId)+'/values:batchUpdate',{method:'POST',body:JSON.stringify({valueInputOption:'RAW',data:edits})});
+  if(newRows.length)await cloudRequest(cloudUrl(CLOUD_SHEET+'!A:F')+':append?valueInputOption=RAW&insertDataOption=INSERT_ROWS',{method:'POST',body:JSON.stringify({values:newRows})});
+  const refreshed=await cloudReadRows();cloud.rows=refreshed.rows;cloud.snapshots=refreshed.snapshots;
+  cloud.baselineKnown=true;cloud.lastSuccessAt=new Date().toISOString();persistCloudBaseline();cloud.state='接続済み';
+  if(edits.length||newRows.length)toast('Googleクラウドに保存できました ✓');
+ }catch(err){cloud.state='同期エラー';toast('クラウド同期に失敗。端末には保存済み：'+err.message)}
+ finally{cloud.busy=false;updateSyncBanner();if(cloud.ready&&cloud.dirtyCounter!==rev){clearTimeout(cloud.timer);cloud.timer=setTimeout(()=>cloudFlush(),650)}}
 }
 async function cloudRefresh(){
  if(!cloud.ready||!cloud.accessToken||cloud.busy||cloud.pendingConflicts.length)return;
- const localIds=new Set(people.map(p=>p.id));
- if(people.some(p=>cloud.snapshots.get(p.id)!==JSON.stringify(p))||[...cloud.snapshots.keys()].some(id=>!localIds.has(id)))return;
+ if(document.activeElement?.matches?.('[data-field]'))return;
+ if(pendingCount()){cloudSchedule();return}
  cloud.busy=true;
- try{const fresh=await cloudReadRows();const changed=fresh.people.length!==people.length||fresh.people.some(p=>cloud.snapshots.get(p.id)!==JSON.stringify(p));if(changed){people=fresh.people;cloud.rows=fresh.rows;cloud.snapshots=fresh.snapshots;localStorage.setItem(STORE_KEY,JSON.stringify(people));if(ui.personId&&!people.some(p=>p.id===ui.personId)){ui.personId=null;ui.view='list'}render();toast('最新のクラウド情報を反映しました。')}}
- catch(err){cloud.state='同期エラー';toast('更新確認に失敗：'+err.message)}finally{cloud.busy=false;}
+ try{
+  const fresh=await cloudReadRows();
+  const changed=fresh.people.length!==people.length||fresh.people.some(p=>cloud.snapshots.get(p.id)!==JSON.stringify(p));
+  if(changed){
+   recoveryBackup('他端末の変更を取り込む前');people=fresh.people;
+   localStorage.setItem(STORE_KEY,JSON.stringify(people));
+   if(ui.personId&&!people.some(p=>p.id===ui.personId)){ui.personId=null;ui.view='list'}
+   render();toast('他端末の変更を反映しました。');
+  }
+  cloud.rows=fresh.rows;cloud.snapshots=fresh.snapshots;cloud.baselineKnown=true;cloud.lastSuccessAt=new Date().toISOString();persistCloudBaseline();
+ }catch(err){cloud.state='更新確認エラー';toast('クラウド確認できません：'+err.message)}
+ finally{cloud.busy=false;updateSyncBanner()}
 }
 window.addEventListener('focus',()=>cloudRefresh());
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')cloudRefresh()});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')cloudRefresh();else if(cloud.ready&&pendingCount())cloudFlush()});
+window.addEventListener('online',()=>{if(cloud.ready&&pendingCount())cloudFlush()});
 setInterval(()=>{if(document.visibilityState==='visible')cloudRefresh()},90000);
-function renderCloudSettings(){return `<div class="card card-pad" style="margin-top:16px"><div class="section-title">☁ Googleクラウド同期</div><div class="section-note">Googleのログインでシートにアクセスします。許可されたユーザーだけが閲覧できます。認証後に読み込むと、編集内容をクラウドに保存します。</div><div class="note" style="margin:12px 0"><b>現在：</b>${esc(cloudMessage())}${cloud.pendingConflicts.length?'<br>⚠️ 他端末との編集競合があります':''}</div><div class="field-grid"><div class="field wide"><label>Google OAuthクライアントID（初回のみ）</label><input id="google-client-id" class="input" value="${esc(cloud.clientId)}" placeholder="123456...apps.googleusercontent.com"></div><div class="field wide"><label>GoogleスプレッドシートID</label><input id="google-sheet-id" class="input" value="${esc(cloud.spreadsheetId)}"></div></div><div class="actionrow" style="margin-top:13px"><button class="btn" data-action="cloud-config">設定を保存</button><button class="btn primary" data-action="cloud-login">Googleでログイン</button><button class="btn dark" data-action="cloud-pull">クラウドから読み込み</button><button class="btn" data-action="cloud-flush">変更を今すぐ同期</button></div><div class="note" style="margin-top:12px">※ OAuthクライアントIDの作成にはGoogle Cloud Consoleで一度だけ設定が必要です。公開リポジトリにはトークンや個人データを保存しません。<br>※ アプリを開き直した場合は再度Googleログインしてください。<br>※ ブラウザ内に保存した古いゲストデータは「クラウドから読み込み」で入れ替わります。</div><details style="margin-top:14px"><summary style="cursor:pointer;font-weight:750">初回接続の手順（1度だけ）</summary><div class="note" style="margin-top:9px">1. <a href="https://console.cloud.google.com/apis/library/sheets.googleapis.com" target="_blank" rel="noopener noreferrer">Google Cloud Console</a>でプロジェクトを作成し、Google Sheets APIを有効化。<br>2. Google認証プラットフォームでOAuth同意画面を設定し、テストユーザーとして自分とリーダーを追加。<br>3. 「OAuthクライアントID」をウェブアプリケーション用に作成。承認済みのJavaScript生成元：<b>https://hanamon21.github.io</b><br>4. 発行されたクライアントIDを上欄に貼って「設定を保存」→「Googleでログイン」→「クラウドから読み込み」。<br>5. リーダーにはGoogleスプレッドシートの共有権限を追加してください。<br>※ OAuthクライアントシークレットは、このアプリには入力しません。</div></details></div>`}
+function renderCloudSettings(){
+ const n=pendingCount();
+ return `<div class="card card-pad" style="margin-top:16px"><div class="section-title">☁ Googleクラウド同期</div><div class="section-note">編集した内容は端末へすぐ保存され、Googleへの送信が完了すると「クラウド保存済み」と表示されます。</div><div class="note ${n?'notice-warn':''}" style="margin:12px 0"><b>保存状態：</b>${esc(cloudMessage())}<br><b>未同期：</b>${n}名<br><b>最終同期：</b>${cloud.lastSuccessAt?esc(new Date(cloud.lastSuccessAt).toLocaleString('ja-JP')):'未確認'}</div><div class="field-grid"><div class="field wide"><label>Google OAuthクライアントID（初回のみ）</label><input id="google-client-id" class="input" value="${esc(cloud.clientId)}" placeholder="123456...apps.googleusercontent.com"></div><div class="field wide"><label>GoogleスプレッドシートID</label><input id="google-sheet-id" class="input" value="${esc(cloud.spreadsheetId)}"></div></div><div class="actionrow" style="margin-top:13px"><button class="btn" data-action="cloud-config">設定を保存</button><button class="btn primary" data-action="cloud-login">Googleに接続</button><button class="btn dark" data-action="cloud-pull">クラウドと照合</button><button class="btn" data-action="cloud-flush">未同期の変更を保存</button>${cloud.pendingConflicts.length?'<button class="btn danger" data-action="sync-resolve">競合を解決</button>':''}</div><div class="note" style="margin-top:12px">※アプリを再起動したら、通常は「Googleに接続」を1回押してください。すでに許可した権限について、毎回同意を求めないように改善しています。<br>※未同期データは端末に保持されます。クラウドのデータで無断上書きしません。<br>※恒久的なログイン保持には別の認証基盤が必要です。</div><details style="margin-top:14px"><summary style="cursor:pointer;font-weight:750">初回接続の手順</summary><div class="note" style="margin-top:9px">Google CloudでGoogle Sheets APIを有効化し、OAuthウェブクライアントの承認済みJavaScript生成元に<b>https://hanamon21.github.io</b>を登録。発行されたクライアントIDを上欄で保存してからGoogleに接続してください。シート共有の権限も必要です。シークレットは入力しません。</div></details></div>`;
+}
 
 const sample=[];
 let people=readStore();
@@ -178,7 +386,7 @@ let ui={view:'list',personId:null,sheet:'new',mode:'edit',filter:'すべて',sea
 let toastTimer;
 let importMode='merge';
 function readStore(){try{const raw=localStorage.getItem(STORE_KEY);if(!raw)return structuredClone(sample);const j=JSON.parse(raw);if(!Array.isArray(j))return structuredClone(sample);if(sample.length && j.length && j.every(p=>String(p.id||'').startsWith('demo-')))return structuredClone(sample);return j;}catch(e){return structuredClone(sample)}}
-function save(){try{localStorage.setItem(STORE_KEY,JSON.stringify(people));cloudSchedule()}catch(e){toast('保存できませんでした。ブラウザの容量・設定をご確認ください。')}}
+function save(){try{localStorage.setItem(STORE_KEY,JSON.stringify(people));cloudSchedule()}catch(e){toast('重大：この端末に保存できません。ブラウザの容量・設定を確認してください。')}}
 function person(){return people.find(p=>p.id===ui.personId)}
 function esc(v){return String(v??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
 function val(p,key){if(key==='seminarSummary')return sessionSummary(p);if(key==='registrationDate')return p.registrationDate||'';return p[key]||''}
@@ -188,15 +396,15 @@ function badge(stage){const s=stageBucket(stage);const cls=s==='活動中'||s===
 function countDue(){const today=new Date().toLocaleDateString('sv-SE');return people.filter(p=>p.nextAction && p.nextDate && p.nextDate<=today).length}
 function initials(name){const x=String(name||'ゲ');return x.startsWith('サンプル ')?x.split(' ')[1]?.slice(0,1)||'ゲ':x.slice(0,1)}
 function render(){const isList=ui.view==='list';const isSettings=ui.view==='settings';const isDue=isList&&ui.filter==='要対応';const isPeople=isList&&!isDue;const p=person();if(!isList&&!isSettings&&!p){ui.view='list';return render()}
- document.getElementById('app').innerHTML=`<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark"><img src="icons/icon-192.png" width="42" height="42" alt="RE:RISE Manager" style="width:42px;height:42px;object-fit:cover;border-radius:11px"></div><div><div class="brand-name">RE:RISE</div><div class="brand-sub">GUEST & ACTIVITY</div></div></div><nav class="nav"><button class="nav-btn ${isPeople?'active':''}" data-action="go-list"><span class="nav-icon">▦</span>人物一覧</button><button class="nav-btn ${isDue?'active':''}" data-action="go-due"><span class="nav-icon">✓</span>要対応</button><button class="nav-btn ${isSettings?'active':''}" data-action="go-settings"><span class="nav-icon">⚙</span>設定</button></nav><div class="side-note">必要な情報だけを、必要なときに。<br>LINE共有は本人確認後に行ってください。<br><br>v1.6・5段階の人物管理</div></aside><main class="main">${isList?renderList():isSettings?renderSettings():renderDetail(p)}</main></div><nav class="mobile-bottom" aria-label="メインメニュー"><button class="${isPeople?'active':''}" data-action="go-list"><span class="emoji">▦</span>人物一覧</button><button class="${isDue?'active':''}" data-action="go-due"><span class="emoji">✓</span>要対応${countDue()?` (${countDue()})`:''}</button><button class="${isSettings?'active':''}" data-action="go-settings"><span class="emoji">⚙</span>設定</button></nav>`;
+ document.getElementById('app').innerHTML=`<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark"><img src="icons/icon-192.png" width="42" height="42" alt="RE:RISE Manager" style="width:42px;height:42px;object-fit:cover;border-radius:11px"></div><div><div class="brand-name">RE:RISE</div><div class="brand-sub">GUEST & ACTIVITY</div></div></div><nav class="nav"><button class="nav-btn ${isPeople?'active':''}" data-action="go-list"><span class="nav-icon">▦</span>人物一覧</button><button class="nav-btn ${isDue?'active':''}" data-action="go-due"><span class="nav-icon">✓</span>要対応</button><button class="nav-btn ${isSettings?'active':''}" data-action="go-settings"><span class="nav-icon">⚙</span>設定</button></nav><div class="side-note">必要な情報だけを、必要なときに。<br>LINE共有は本人確認後に行ってください。<br><br>v1.7・データ保護と同期状態</div></aside><main class="main">${cloudBanner()}${isList?renderList():isSettings?renderSettings():renderDetail(p)}</main></div><nav class="mobile-bottom" aria-label="メインメニュー"><button class="${isPeople?'active':''}" data-action="go-list"><span class="emoji">▦</span>人物一覧</button><button class="${isDue?'active':''}" data-action="go-due"><span class="emoji">✓</span>要対応${countDue()?` (${countDue()})`:''}</button><button class="${isSettings?'active':''}" data-action="go-settings"><span class="emoji">⚙</span>設定</button></nav>`;
  if(isList)renderPeople();
 }
 function renderList(){
  const due=ui.filter==='要対応';
  const categoryTabs=!due?`<div class="stage-tabs" role="group" aria-label="人物をステータス別に表示">${LIST_FILTERS.map(stage=>`<button type="button" class="stage-tab ${ui.filter===stage?'active':''}" data-action="filter-stage" data-stage="${esc(stage)}" aria-pressed="${ui.filter===stage}"><span>${esc(stage)}</span><span class="stage-count">${stage==='すべて'?people.length:people.filter(p=>stageBucket(p.stage)===stage).length}</span></button>`).join('')}</div>`:`<div class="actionrow" style="margin-bottom:15px"><button class="btn small" data-action="go-list">〈 すべての人物へ</button></div>`;
- return `<header class="topbar"><div><div class="eyebrow">RE:RISE Manager</div><h1 class="heading">${due?'要対応':'人物一覧'}</h1><div class="subheading">${due?'期限が来た次のアクションを確認':'5つの状態で切り替え。☁ '+esc(cloudMessage())}</div></div><button class="btn primary" data-action="new-person">＋ 人物追加</button></header><div class="stats"><div class="stat"><div class="stat-label">管理人数</div><div class="stat-n">${people.length}</div></div><div class="stat"><div class="stat-label">登録済み・活動中</div><div class="stat-n">${people.filter(p=>['登録済み','活動中'].includes(stageBucket(p.stage))).length}</div></div><div class="stat"><div class="stat-label">期限が来た次の行動</div><div class="stat-n">${countDue()}</div></div></div><div class="card card-pad">${categoryTabs}<div class="toolbar"><input id="search" class="input search" aria-label="名前で検索" placeholder="🔎 名前・担当者で検索" value="${esc(ui.search)}"></div><div class="list-count" id="list-count" aria-live="polite"></div><div id="people-list" class="people"></div></div><div class="note notice-warn" style="margin-top:17px">🔒 <b>データの保存について：</b> Google連携中は編集がクラウドに同期されます。未接続の場合は端末内に保存されます。</div>`
+ return `<header class="topbar"><div><div class="eyebrow">RE:RISE Manager</div><h1 class="heading">${due?'要対応':'人物一覧'}</h1><div class="subheading">${due?'期限が来た次のアクションを確認':'5つの状態で切り替え。☁ '+esc(cloudMessage())}</div></div><button class="btn primary" data-action="new-person">＋ 人物追加</button></header><div class="stats"><div class="stat"><div class="stat-label">管理人数</div><div class="stat-n">${people.length}</div></div><div class="stat"><div class="stat-label">登録済み・活動中</div><div class="stat-n">${people.filter(p=>['登録済み','活動中'].includes(stageBucket(p.stage))).length}</div></div><div class="stat"><div class="stat-label">期限が来た次の行動</div><div class="stat-n">${countDue()}</div></div></div><div class="card card-pad">${categoryTabs}<div class="toolbar"><input id="search" class="input search" aria-label="名前で検索" placeholder="🔎 名前・担当者で検索" value="${esc(ui.search)}"></div><div class="list-count" id="list-count" aria-live="polite"></div><div id="people-list" class="people"></div></div><div class="note notice-warn" style="margin-top:17px">🔒 <b>データの保存について：</b> 画面上部が『Googleクラウドに保存済み』のときだけ同期完了です。それ以外は端末内に保存されます。</div>`
 }
-function renderSettings(){return `<header class="topbar"><div><div class="eyebrow">RE:RISE Manager</div><h1 class="heading">設定</h1><div class="subheading">データの管理とアプリの確認。</div></div></header><div class="card card-pad"><div class="section-title">データのバックアップ</div><div class="section-note">保存済みの情報を書き出したり、以前のバックアップを読み込めます。</div><button class="btn primary" style="margin-top:17px" data-action="backup">バックアップ・データ取り込み</button></div><div class="note notice-warn" style="margin-top:17px"><b>データの安全性について：</b> クラウドを有効化するまでは端末内にだけ保存されます。共有アクセスはGoogleスプレッドシートの共有権限に従います。バックアップファイルは暗号化されません。</div><div class="note" style="margin-top:12px">アプリ：RE:RISE Manager v1.6（iPhoneホーム画面対応・Google同期）</div>${renderCloudSettings()}`}
+function renderSettings(){return `<header class="topbar"><div><div class="eyebrow">RE:RISE Manager</div><h1 class="heading">設定</h1><div class="subheading">データの管理とアプリの確認。</div></div></header><div class="card card-pad"><div class="section-title">データのバックアップ</div><div class="section-note">保存済みの情報を書き出したり、以前のバックアップを読み込めます。</div><div class="actionrow" style="margin-top:17px"><button class="btn primary" data-action="backup">バックアップ・データ取り込み</button><button class="btn" data-action="recovery-list">過去の入力を復元</button></div></div><div class="note notice-warn" style="margin-top:17px"><b>データの安全性について：</b> クラウドを有効化するまでは端末内にだけ保存されます。共有アクセスはGoogleスプレッドシートの共有権限に従います。バックアップファイルは暗号化されません。</div><div class="note" style="margin-top:12px">アプリ：RE:RISE Manager v1.7（未同期保護・Google同期）</div>${renderCloudSettings()}`}
 function renderPeople(){
  const out=document.getElementById('people-list');if(!out)return;
  const today=new Date().toLocaleDateString('sv-SE');
@@ -296,7 +504,11 @@ document.addEventListener('click',async e=>{if(e.target.dataset.backdrop){closeM
  if(a==='cloud-config'){cloudConfigSave();return}
  if(a==='cloud-login'){cloudSignIn();return}
  if(a==='cloud-pull'){await cloudPull();return}
- if(a==='cloud-flush'){if(!cloud.ready){toast('先にクラウドから読み込んでください');return}await cloudFlush();return}
+ if(a==='cloud-flush'){if(!cloud.ready){toast('Googleへの接続が必要です。端末の内容は保持中。');return}await cloudFlush();return}
+ if(a==='sync-resolve'){showCloudConflicts();return}
+ if(a==='recovery-list'){showRecovery();return}
+ if(a==='restore-snapshot'){restoreSnapshot(Number(b.dataset.ref));return}
+ if(a==='resolve-local'||a==='resolve-remote'){resolveCloudConflict(b.dataset.id,a==='resolve-local'?'local':'remote');return}
  if(a==='open-person'){ui.personId=b.dataset.id;ui.sheet='new';ui.mode='edit';changeView('sheet');return}
  if(a==='sheet-type'){ui.sheet=b.dataset.id;ui.mode='edit';render();return}
  if(a==='mode'){ui.mode=b.dataset.id;render();return}
