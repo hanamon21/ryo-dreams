@@ -80,7 +80,7 @@
 <script>
 (()=>{'use strict';
 const STORE_KEY='rerise.manager.mvp.v1';
-const APP_VERSION='1.9';
+const APP_VERSION='1.9.1';
 // Six selectable stages; legacy labels remain untouched in Google Sheets until user edits them.
 // Never guess a registration category when the historical type is absent.
 const STAGES=['アポ前','ご案内中','登録済み（愛用）','登録済み（ビジネス）','ビジネスメンバー','見送り'];
@@ -123,8 +123,10 @@ const CLOUD_SETTINGS_KEY='rerise.manager.cloud.v1';
 const CLOUD_BASE_KEY='rerise.manager.cloud.base.v17';
 const CLOUD_BACKUPS_KEY='rerise.manager.cloud.recovery.v17';
 const CLOUD_DEFAULT_ID='19i7zJ7bDYrlB4MWGW23r9UlLr-f8DKsqRztylSzKR6M';
+// A public OAuth Web Client ID (not a secret). Authorized origins remain enforced by Google.
+const CLOUD_DEFAULT_CLIENT_ID='907763053450-bbvatq9tvkd414fgfbeu723bfub83f8h.apps.googleusercontent.com';
 const cloudSaved=(()=>{try{return JSON.parse(localStorage.getItem(CLOUD_SETTINGS_KEY)||'{}')}catch{return {}}})();
-const cloud={clientId:cloudSaved.clientId||'',spreadsheetId:cloudSaved.spreadsheetId||CLOUD_DEFAULT_ID,accessToken:'',state:'未接続',ready:false,rows:new Map(),snapshots:new Map(),baselineKnown:false,lastSuccessAt:'',timer:null,busy:false,dirtyCounter:0,pendingConflicts:[],resolutionRemote:null,reconciledDraft:null};
+const cloud={clientId:cloudSaved.clientId||CLOUD_DEFAULT_CLIENT_ID,spreadsheetId:cloudSaved.spreadsheetId||CLOUD_DEFAULT_ID,accessToken:'',state:'未接続',ready:false,rows:new Map(),snapshots:new Map(),baselineKnown:false,lastSuccessAt:'',timer:null,busy:false,dirtyCounter:0,pendingConflicts:[],resolutionRemote:null,reconciledDraft:null};
 const API='https://sheets.googleapis.com/v4/spreadsheets/';
 const CLOUD_SHEET='People';
 function restoreCloudBaseline(){
@@ -184,7 +186,7 @@ function recoveryBackup(reason){
  }catch(e){toast('自動バックアップ容量に注意。JSONの書き出しも利用してください。')}
 }
 function cloudConfigSave(){
- let id=document.getElementById('google-client-id')?.value.trim()||'';let sid=document.getElementById('google-sheet-id')?.value.trim()||'';
+ let id=document.getElementById('google-client-id')?.value.trim()||CLOUD_DEFAULT_CLIENT_ID;let sid=document.getElementById('google-sheet-id')?.value.trim()||'';
  sid=sid.match(/\/spreadsheets\/d\/([A-Za-z0-9_-]+)/)?.[1]||sid;
  if(sid&&!/^[A-Za-z0-9_-]{20,}$/.test(sid)){toast('スプレッドシートIDが正しくありません');return}
  if(id&&!/^[0-9]+-[a-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id)){toast('Google OAuthクライアントIDを確認してください');return}
@@ -418,7 +420,7 @@ window.addEventListener('online',()=>{if(cloud.ready&&pendingCount())cloudFlush(
 setInterval(()=>{if(document.visibilityState==='visible')cloudRefresh()},90000);
 function renderCloudSettings(){
  const n=pendingCount();
- return `<div class="card card-pad" style="margin-top:16px"><div class="section-title">☁ Googleクラウド同期</div><div class="section-note">編集した内容は端末へすぐ保存され、Googleへの送信が完了すると「クラウド保存済み」と表示されます。</div><div class="note ${n?'notice-warn':''}" style="margin:12px 0"><b>保存状態：</b>${esc(cloudMessage())}<br><b>未同期：</b>${n}名<br><b>最終同期：</b>${cloud.lastSuccessAt?esc(new Date(cloud.lastSuccessAt).toLocaleString('ja-JP')):'未確認'}</div><div class="field-grid"><div class="field wide"><label>Google OAuthクライアントID（初回のみ）</label><input id="google-client-id" class="input" value="${esc(cloud.clientId)}" placeholder="123456...apps.googleusercontent.com"></div><div class="field wide"><label>GoogleスプレッドシートID</label><input id="google-sheet-id" class="input" value="${esc(cloud.spreadsheetId)}"></div></div><div class="actionrow" style="margin-top:13px"><button class="btn" data-action="cloud-config">設定を保存</button><button class="btn primary" data-action="cloud-login">Googleに接続</button><button class="btn dark" data-action="cloud-pull">クラウドと照合</button><button class="btn" data-action="cloud-flush">未同期の変更を保存</button>${cloud.pendingConflicts.length?'<button class="btn danger" data-action="sync-resolve">競合を解決</button>':''}</div><div class="note" style="margin-top:12px">※アプリを再起動したら、通常は「Googleに接続」を1回押してください。すでに許可した権限について、毎回同意を求めないように改善しています。<br>※未同期データは端末に保持されます。クラウドのデータで無断上書きしません。<br>※恒久的なログイン保持には別の認証基盤が必要です。</div><details style="margin-top:14px"><summary style="cursor:pointer;font-weight:750">初回接続の手順</summary><div class="note" style="margin-top:9px">Google CloudでGoogle Sheets APIを有効化し、OAuthウェブクライアントの承認済みJavaScript生成元に<b>https://hanamon21.github.io</b>を登録。発行されたクライアントIDを上欄で保存してからGoogleに接続してください。シート共有の権限も必要です。シークレットは入力しません。</div></details></div>`;
+ return `<div class="card card-pad" style="margin-top:16px"><div class="section-title">☁ Googleクラウド同期</div><div class="section-note">編集した内容は端末へすぐ保存され、Googleへの送信が完了すると「クラウド保存済み」と表示されます。</div><div class="note ${n?'notice-warn':''}" style="margin:12px 0"><b>保存状態：</b>${esc(cloudMessage())}<br><b>未同期：</b>${n}名<br><b>最終同期：</b>${cloud.lastSuccessAt?esc(new Date(cloud.lastSuccessAt).toLocaleString('ja-JP')):'未確認'}</div><div class="field-grid"><div class="field wide"><label>Google OAuthクライアントID（設定済み・通常は変更不要）</label><input id="google-client-id" class="input" value="${esc(cloud.clientId)}" placeholder="123456...apps.googleusercontent.com"></div><div class="field wide"><label>GoogleスプレッドシートID</label><input id="google-sheet-id" class="input" value="${esc(cloud.spreadsheetId)}"></div></div><div class="actionrow" style="margin-top:13px"><button class="btn" data-action="cloud-config">設定を保存</button><button class="btn primary" data-action="cloud-login">Googleに接続</button><button class="btn dark" data-action="cloud-pull">クラウドと照合</button><button class="btn" data-action="cloud-flush">未同期の変更を保存</button>${cloud.pendingConflicts.length?'<button class="btn danger" data-action="sync-resolve">競合を解決</button>':''}</div><div class="note" style="margin-top:12px">※アプリを再起動したら、通常は「Googleに接続」を1回押してください。すでに許可した権限について、毎回同意を求めないように改善しています。<br>※未同期データは端末に保持されます。クラウドのデータで無断上書きしません。<br>※恒久的なログイン保持には別の認証基盤が必要です。</div><details style="margin-top:14px"><summary style="cursor:pointer;font-weight:750">初回接続の手順</summary><div class="note" style="margin-top:9px">Google CloudでGoogle Sheets APIを有効化し、OAuthウェブクライアントの承認済みJavaScript生成元に<b>https://hanamon21.github.io</b>を登録。このアプリにはOAuthクライアントIDを登録済みです。新しい端末でもIDの入力や設定の保存は不要です。「Googleに接続」からログインしてください。シート共有の権限は引き続き必要です。シークレットは入力しません。</div></details></div>`;
 }
 
 const sample=[];
@@ -453,7 +455,7 @@ function badge(p){const s=stageBucket(p);const cls=s==='ビジネスメンバー
 function countDue(){const today=new Date().toLocaleDateString('sv-SE');return people.filter(p=>p.nextAction && p.nextDate && p.nextDate<=today).length}
 function initials(name){const x=String(name||'ゲ');return x.startsWith('サンプル ')?x.split(' ')[1]?.slice(0,1)||'ゲ':x.slice(0,1)}
 function render(){const isList=ui.view==='list';const isSettings=ui.view==='settings';const isDue=isList&&ui.filter==='要対応';const isPeople=isList&&!isDue;const p=person();if(!isList&&!isSettings&&!p){ui.view='list';return render()}
- document.getElementById('app').innerHTML=`<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark"><img src="icons/icon-192.png" width="42" height="42" alt="RE:RISE Manager" style="width:42px;height:42px;object-fit:cover;border-radius:11px"></div><div><div class="brand-name">RE:RISE</div><div class="brand-sub">GUEST & ACTIVITY</div></div></div><nav class="nav"><button class="nav-btn ${isPeople?'active':''}" data-action="go-list"><span class="nav-icon">▦</span>人物一覧</button><button class="nav-btn ${isDue?'active':''}" data-action="go-due"><span class="nav-icon">✓</span>要対応</button><button class="nav-btn ${isSettings?'active':''}" data-action="go-settings"><span class="nav-icon">⚙</span>設定</button></nav><div class="side-note">必要な情報だけを、必要なときに。<br>LINE共有は本人確認後に行ってください。<br><br>v1.9・入力改善と活動履歴</div></aside><main class="main">${cloudBanner()}${isList?renderList():isSettings?renderSettings():renderDetail(p)}</main></div><nav class="mobile-bottom" aria-label="メインメニュー"><button class="${isPeople?'active':''}" data-action="go-list"><span class="emoji">▦</span>人物一覧</button><button class="${isDue?'active':''}" data-action="go-due"><span class="emoji">✓</span>要対応${countDue()?` (${countDue()})`:''}</button><button class="${isSettings?'active':''}" data-action="go-settings"><span class="emoji">⚙</span>設定</button></nav>`;
+ document.getElementById('app').innerHTML=`<div class="shell"><aside class="sidebar"><div class="brand"><div class="brand-mark"><img src="icons/icon-192.png" width="42" height="42" alt="RE:RISE Manager" style="width:42px;height:42px;object-fit:cover;border-radius:11px"></div><div><div class="brand-name">RE:RISE</div><div class="brand-sub">GUEST & ACTIVITY</div></div></div><nav class="nav"><button class="nav-btn ${isPeople?'active':''}" data-action="go-list"><span class="nav-icon">▦</span>人物一覧</button><button class="nav-btn ${isDue?'active':''}" data-action="go-due"><span class="nav-icon">✓</span>要対応</button><button class="nav-btn ${isSettings?'active':''}" data-action="go-settings"><span class="nav-icon">⚙</span>設定</button></nav><div class="side-note">必要な情報だけを、必要なときに。<br>LINE共有は本人確認後に行ってください。<br><br>v1.9.1・Google接続設定済み</div></aside><main class="main">${cloudBanner()}${isList?renderList():isSettings?renderSettings():renderDetail(p)}</main></div><nav class="mobile-bottom" aria-label="メインメニュー"><button class="${isPeople?'active':''}" data-action="go-list"><span class="emoji">▦</span>人物一覧</button><button class="${isDue?'active':''}" data-action="go-due"><span class="emoji">✓</span>要対応${countDue()?` (${countDue()})`:''}</button><button class="${isSettings?'active':''}" data-action="go-settings"><span class="emoji">⚙</span>設定</button></nav>`;
  if(isList)renderPeople();
 }
 function renderList(){
