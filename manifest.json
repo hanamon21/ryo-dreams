@@ -1,11 +1,13 @@
 {
-  "name": "RYO 20の夢",
-  "short_name": "RYO夢20",
-  "description": "RYOの20の夢をスマホでいつでも確認できるWebアプリ",
+  "name": "RYO'S VISION｜夢を、毎日の原動力に。",
+  "short_name": "RYOの夢",
+  "description": "20の夢をすぐに眺めて、未来の自分を思い描くビジョンアプリ。",
   "start_url": "./",
+  "scope": "./",
   "display": "standalone",
-  "background_color": "#06172c",
-  "theme_color": "#06172c",
+  "background_color": "#071b32",
+  "theme_color": "#071b32",
+  "lang": "ja",
   "icons": [
     {
       "src": "icon-192.png",
